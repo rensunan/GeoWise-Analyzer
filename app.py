@@ -238,6 +238,7 @@ class TableProcessor:
             current_row = table_data[i]
 
             # 计算匹配度
+            # 计算匹配度
             match_count = 0
             for j, header_text in header_non_empty:
                 if j < len(current_row) and current_row[j] == header_text:
