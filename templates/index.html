@@ -58,6 +58,26 @@
         .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); width: 0%; transition: width 0.3s; }
         .progress-text { text-align: center; color: #666; margin-top: 10px; }
 
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            background: white;
+            padding: 12px 20px;
+            border-radius: 50px;
+            flex-wrap: wrap;
+        }
+        .tab-btn {
+            background: #f0f0f0;
+            border: none;
+            padding: 10px 24px;
+            border-radius: 30px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        .tab-btn.active { background: linear-gradient(135deg, #667eea, #764ba2); color: white; }
+
         .table-card {
             background: white;
             border-radius: 16px;
@@ -98,6 +118,26 @@
             top: 0;
         }
 
+        .info-bar {
+            background: #e8f4f8;
+            border-radius: 12px;
+            padding: 10px 15px;
+            margin-bottom: 15px;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        .badge {
+            background: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            color: #667eea;
+        }
+        .badge-main { background: #d0f0d0; color: #2c6e2c; }
+        .badge-remark { background: #f0e6d0; color: #cc6600; }
+        .badge-sub { background: #d0e8f0; color: #0066cc; }
+
         .stats {
             display: flex;
             gap: 15px;
@@ -120,13 +160,14 @@
         .success-msg { position: fixed; bottom: 20px; right: 20px; background: #28a745; color: white; padding: 12px 24px; border-radius: 8px; display: none; z-index: 1000; }
 
         .empty-placeholder { background-color: #f5f5f5 !important; color: #999; }
+        .section-title { margin: 15px 0 10px 0; font-size: 14px; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🏗️ 岩土报告智能解析系统</h1>
-            <p>原始表格提取与显示 | 先合并相邻相同单元格，再按表头切分</p>
+            <p>基于大语言模型的表格解析 | 主表 / 备注 / 附表识别</p>
         </div>
 
         <div class="upload-area" id="uploadArea">
@@ -146,7 +187,12 @@
 
         <div class="results-container" id="resultsContainer" style="display: none;">
             <div class="stats" id="statsContainer"></div>
-            <div id="originalContent"></div>
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="parsed">📊 解析结果</button>
+                <button class="tab-btn" data-tab="original">📋 原始表格</button>
+            </div>
+            <div id="parsedContent"></div>
+            <div id="originalContent" style="display: none;"></div>
         </div>
     </div>
 
@@ -246,13 +292,122 @@
 
         function displayResults(result) {
             const tables = result.tables || [];
+            let totalMainTables = 0;
+            let totalRemarks = 0;
+            let totalSubTables = 0;
+
+            tables.forEach(t => {
+                if (t.main_table && t.main_table.length > 0) totalMainTables++;
+                totalRemarks += t.remarks?.length || 0;
+                totalSubTables += t.sub_tables?.length || 0;
+            });
 
             document.getElementById('statsContainer').innerHTML = `
-                <div class="stat-card"><div class="stat-number">${tables.length}</div><div class="stat-label">表格数量</div></div>
-                <div class="stat-card"><div class="stat-number">${result.text_count || 0}</div><div class="stat-label">文本段落</div></div>
+                <div class="stat-card"><div class="stat-number">${tables.length}</div><div class="stat-label">解析表格</div></div>
+                <div class="stat-card"><div class="stat-number">${totalMainTables}</div><div class="stat-label">主表</div></div>
+                <div class="stat-card"><div class="stat-number">${totalRemarks}</div><div class="stat-label">备注</div></div>
+                <div class="stat-card"><div class="stat-number">${totalSubTables}</div><div class="stat-label">附表</div></div>
             `;
 
+            displayParsedTables(tables);
             displayOriginalTables(tables);
+        }
+
+        function displayParsedTables(tables) {
+            const container = document.getElementById('parsedContent');
+            if (!tables || tables.length === 0) {
+                container.innerHTML = '<div class="table-card"><p>未检测到表格数据</p></div>';
+                return;
+            }
+
+            container.innerHTML = tables.map((table, idx) => {
+                const tableId = table.table_id || `T_${idx+1}`;
+                const mainTable = table.main_table || [];
+                const remarks = table.remarks || [];
+                const subTables = table.sub_tables || [];
+                const parseResult = table.parse_result || {};
+
+                return `
+                    <div class="table-card">
+                        <div class="table-title">
+                            <span>📊 ${escapeHtml(tableId)}</span>
+                            <span class="badge">${table.metadata?.rows || 0}行 × ${table.metadata?.cols || 0}列</span>
+                        </div>
+
+                        <div class="info-bar">
+                            <span class="badge badge-main">📌 主表: ${parseResult.has_main_table ? '是' : '否'}</span>
+                            <span class="badge badge-remark">📝 备注: ${parseResult.has_remarks ? remarks.length + '个' : '无'}</span>
+                            <span class="badge badge-sub">📋 附表: ${parseResult.has_sub_tables ? subTables.length + '个' : '无'}</span>
+                        </div>
+
+                        ${mainTable.length > 0 ? `
+                            <div class="section-title">📌 主表</div>
+                            <div class="scrollable">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            ${mainTable[0]?.map((_, colIdx) => `<th>列${colIdx}</th>`).join('')}
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${mainTable.map((row, rowIdx) => `
+                                            <tr>
+                                                ${row.map(cell => {
+                                                    const isEmpty = !cell || cell === '/' || cell === '—' || cell === '-';
+                                                    return `<td class="${isEmpty ? 'empty-placeholder' : ''}">${escapeHtml(cell || '')}</td>`;
+                                                }).join('')}
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        ` : ''}
+
+                        ${remarks.length > 0 ? `
+                            <div class="section-title">📝 备注信息</div>
+                            ${remarks.map((remark, rIdx) => `
+                                <div style="background: #f8f9fa; padding: 10px; margin-bottom: 10px; border-radius: 8px;">
+                                    <div style="font-size: 12px; color: #666;">备注 ${rIdx + 1}</div>
+                                    <div style="margin-top: 5px;">
+                                        ${remark.data?.map(row => row.join(' | ')).join('<br>') || '无内容'}
+                                    </div>
+                                </div>
+                            `).join('')}
+                        ` : ''}
+
+                        ${subTables.length > 0 ? `
+                            <div class="section-title">📋 附表</div>
+                            ${subTables.map((subTab, sIdx) => `
+                                <div style="margin-bottom: 15px; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
+                                    <div style="background: #e8f4f8; padding: 8px 12px; font-size: 12px; font-weight: bold;">附表 ${sIdx + 1}</div>
+                                    <div class="scrollable" style="max-height: 300px;">
+                                        <table class="data-table">
+                                            <thead>
+                                                <tr>
+                                                    ${subTab.data?.[0]?.map((_, colIdx) => `<th>列${colIdx}</th>`).join('')}
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                ${subTab.data?.map(row => `
+                                                    <tr>
+                                                        ${row.map(cell => {
+                                                            const isEmpty = !cell || cell === '/' || cell === '—' || cell === '-';
+                                                            return `<td class="${isEmpty ? 'empty-placeholder' : ''}">${escapeHtml(cell || '')}</td>`;
+                                                        }).join('')}
+                                                    </tr>
+                                                `).join('')}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        ` : ''}
+
+                        ${mainTable.length === 0 && remarks.length === 0 && subTables.length === 0 ?
+                            '<p style="color: #999;">未能解析出结构化数据</p>' : ''}
+                    </div>
+                `;
+            }).join('');
         }
 
         function displayOriginalTables(tables) {
@@ -317,6 +472,16 @@
             div.textContent = String(text);
             return div.innerHTML;
         }
+
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.onclick = () => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                const tab = btn.dataset.tab;
+                document.getElementById('parsedContent').style.display = tab === 'parsed' ? 'block' : 'none';
+                document.getElementById('originalContent').style.display = tab === 'original' ? 'block' : 'none';
+            };
+        });
     </script>
 </body>
 </html>
