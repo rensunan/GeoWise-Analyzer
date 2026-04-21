@@ -137,6 +137,7 @@
         .badge-main { background: #d0f0d0; color: #2c6e2c; }
         .badge-remark { background: #f0e6d0; color: #cc6600; }
         .badge-sub { background: #d0e8f0; color: #0066cc; }
+        .badge-optimized { background: #e0d0f0; color: #8844aa; }
 
         .stats {
             display: flex;
@@ -161,13 +162,22 @@
 
         .empty-placeholder { background-color: #f5f5f5 !important; color: #999; }
         .section-title { margin: 15px 0 10px 0; font-size: 14px; font-weight: bold; }
+        .optimization-note {
+            background: #f0eaff;
+            border-radius: 8px;
+            padding: 8px 12px;
+            margin-bottom: 15px;
+            font-size: 12px;
+            color: #8844aa;
+            display: inline-block;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🏗️ 岩土报告智能解析系统</h1>
-            <p>基于大语言模型的表格解析 | 主表 / 备注 / 附表识别</p>
+            <p>基于大语言模型的表格解析 | 主表 / 备注 / 附表识别 | 二次优化解析</p>
         </div>
 
         <div class="upload-area" id="uploadArea">
@@ -188,10 +198,12 @@
         <div class="results-container" id="resultsContainer" style="display: none;">
             <div class="stats" id="statsContainer"></div>
             <div class="tabs">
-                <button class="tab-btn active" data-tab="parsed">📊 解析结果</button>
+                <button class="tab-btn active" data-tab="parsed">📊 第一次解析结果</button>
+                <button class="tab-btn" data-tab="secondary">✨ 二次优化结果</button>
                 <button class="tab-btn" data-tab="original">📋 原始表格</button>
             </div>
             <div id="parsedContent"></div>
+            <div id="secondaryContent" style="display: none;"></div>
             <div id="originalContent" style="display: none;"></div>
         </div>
     </div>
@@ -295,11 +307,14 @@
             let totalMainTables = 0;
             let totalRemarks = 0;
             let totalSubTables = 0;
+            let totalOptimized = 0;
 
             tables.forEach(t => {
                 if (t.main_table && t.main_table.length > 0) totalMainTables++;
                 totalRemarks += t.remarks?.length || 0;
                 totalSubTables += t.sub_tables?.length || 0;
+                if (t.secondary_optimization?.main_table_optimized?.has_optimization) totalOptimized++;
+                totalOptimized += t.secondary_optimization?.sub_tables_optimized?.filter(o => o.has_optimization).length || 0;
             });
 
             document.getElementById('statsContainer').innerHTML = `
@@ -307,12 +322,15 @@
                 <div class="stat-card"><div class="stat-number">${totalMainTables}</div><div class="stat-label">主表</div></div>
                 <div class="stat-card"><div class="stat-number">${totalRemarks}</div><div class="stat-label">备注</div></div>
                 <div class="stat-card"><div class="stat-number">${totalSubTables}</div><div class="stat-label">附表</div></div>
+                <div class="stat-card"><div class="stat-number">${totalOptimized}</div><div class="stat-label">已优化</div></div>
             `;
 
             displayParsedTables(tables);
+            displaySecondaryOptimization(tables);
             displayOriginalTables(tables);
         }
 
+        // 第一次解析结果 - 完全保持原样显示
         function displayParsedTables(tables) {
             const container = document.getElementById('parsedContent');
             if (!tables || tables.length === 0) {
@@ -346,11 +364,11 @@
                                 <table class="data-table">
                                     <thead>
                                         <tr>
-                                            ${mainTable[0]?.map((_, colIdx) => `<th>列${colIdx}</th>`).join('')}
+                                            ${mainTable[0]?.map((cell, colIdx) => `<th>${escapeHtml(cell) || `列${colIdx}`}</th>`).join('')}
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        ${mainTable.map((row, rowIdx) => `
+                                        ${mainTable.slice(1).map((row, rowIdx) => `
                                             <tr>
                                                 ${row.map(cell => {
                                                     const isEmpty = !cell || cell === '/' || cell === '—' || cell === '-';
@@ -384,11 +402,11 @@
                                         <table class="data-table">
                                             <thead>
                                                 <tr>
-                                                    ${subTab.data?.[0]?.map((_, colIdx) => `<th>列${colIdx}</th>`).join('')}
+                                                    ${subTab.data?.[0]?.map((cell, colIdx) => `<th>${escapeHtml(cell) || `列${colIdx}`}</th>`).join('')}
                                                 </tr>
                                             </thead>
                                             <tbody>
-                                                ${subTab.data?.map(row => `
+                                                ${subTab.data?.slice(1).map(row => `
                                                     <tr>
                                                         ${row.map(cell => {
                                                             const isEmpty = !cell || cell === '/' || cell === '—' || cell === '-';
@@ -405,6 +423,105 @@
 
                         ${mainTable.length === 0 && remarks.length === 0 && subTables.length === 0 ?
                             '<p style="color: #999;">未能解析出结构化数据</p>' : ''}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // 二次优化结果 - 直接显示优化后的表格，格式和第一次解析一样
+        function displaySecondaryOptimization(tables) {
+            const container = document.getElementById('secondaryContent');
+            if (!tables || tables.length === 0) {
+                container.innerHTML = '<div class="table-card"><p>未检测到表格数据</p></div>';
+                return;
+            }
+
+            let hasAnyOptimization = false;
+            for (const table of tables) {
+                const secOpt = table.secondary_optimization || {};
+                if (secOpt.main_table_optimized?.has_optimization ||
+                    (secOpt.sub_tables_optimized?.some(o => o.has_optimization))) {
+                    hasAnyOptimization = true;
+                    break;
+                }
+            }
+
+            if (!hasAnyOptimization) {
+                container.innerHTML = '<div class="table-card"><p>✨ 未检测到需要优化的内容（无重复行/重复列或合并表头）</p></div>';
+                return;
+            }
+
+            container.innerHTML = tables.map((table, idx) => {
+                const tableId = table.table_id || `T_${idx+1}`;
+                const secOpt = table.secondary_optimization || {};
+                const mainOpt = secOpt.main_table_optimized;
+                const subOpts = secOpt.sub_tables_optimized || [];
+
+                // 收集所有需要显示的优化结果
+                const optimizations = [];
+
+                if (mainOpt && mainOpt.has_optimization && mainOpt.optimized && mainOpt.optimized.length > 0) {
+                    optimizations.push({
+                        type: 'main',
+                        title: '主表优化结果',
+                        data: mainOpt.optimized,
+                        explanation: mainOpt.explanation,
+                        optTypes: mainOpt.optimization_type || []
+                    });
+                }
+
+                for (const subOpt of subOpts) {
+                    if (subOpt.has_optimization && subOpt.optimized && subOpt.optimized.length > 0) {
+                        optimizations.push({
+                            type: 'sub',
+                            index: subOpt.sub_table_index,
+                            title: `附表 ${subOpt.sub_table_index + 1} 优化结果`,
+                            data: subOpt.optimized,
+                            explanation: subOpt.explanation,
+                            optTypes: subOpt.optimization_type || []
+                        });
+                    }
+                }
+
+                if (optimizations.length === 0) return '';
+
+                return `
+                    <div class="table-card">
+                        <div class="table-title">
+                            <span>✨ ${escapeHtml(tableId)} - 二次优化结果</span>
+                            <span class="badge badge-optimized">大模型智能优化</span>
+                        </div>
+
+                        ${optimizations.map(opt => `
+                            <div style="margin-top: ${optimizations.indexOf(opt) > 0 ? '20px' : '0'};">
+                                <div class="section-title">
+                                    ${opt.title}
+                                    ${opt.optTypes.map(type =>
+                                        `<span class="optimization-note" style="margin-left: 10px;">${type === 'duplicate_rows' ? '🔄 已去重行' : type === 'duplicate_cols' ? '📊 已去重列' : '🔧 已拆分表头'}</span>`
+                                    ).join('')}
+                                </div>
+                                ${opt.explanation ? `<div class="optimization-note" style="margin-bottom: 10px; display: block;">💡 ${escapeHtml(opt.explanation)}</div>` : ''}
+                                <div class="scrollable">
+                                    <table class="data-table">
+                                        <thead>
+                                            <tr>
+                                                ${opt.data[0]?.map((cell, colIdx) => `<th>${escapeHtml(cell) || `列${colIdx}`}</th>`).join('')}
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            ${opt.data.slice(1).map((row, rowIdx) => `
+                                                <tr>
+                                                    ${row.map(cell => {
+                                                        const isEmpty = !cell || cell === '/' || cell === '—' || cell === '-';
+                                                        return `<td class="${isEmpty ? 'empty-placeholder' : ''}">${escapeHtml(cell || '')}</td>`;
+                                                    }).join('')}
+                                                </tr>
+                                            `).join('')}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        `).join('')}
                     </div>
                 `;
             }).join('');
@@ -479,6 +596,7 @@
                 btn.classList.add('active');
                 const tab = btn.dataset.tab;
                 document.getElementById('parsedContent').style.display = tab === 'parsed' ? 'block' : 'none';
+                document.getElementById('secondaryContent').style.display = tab === 'secondary' ? 'block' : 'none';
                 document.getElementById('originalContent').style.display = tab === 'original' ? 'block' : 'none';
             };
         });
