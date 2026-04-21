@@ -503,7 +503,7 @@ class GeotechnicalParserSystem:
 
         parsed_tables = []
         for idx, table_data in enumerate(raw_tables):
-            print(f"    处理表格 T_{idx+1:04d}: 原始 {len(table_data)}行")
+            print(f"    处理表格 T_{idx + 1:04d}: 原始 {len(table_data)}行")
 
             # 第一步：按表头切分
             split_tables = self.table_processor.split_by_header(table_data)
@@ -530,10 +530,15 @@ class GeotechnicalParserSystem:
                 if parse_result.get("has_remarks"):
                     for remark in parse_result.get("remarks", []):
                         remark_content = self.table_extractor.extract_sub_table(merged_table, remark)
+                        # 对备注内容进行去重处理
+                        deduplicated_content = self._deduplicate_remark_content(remark_content)
                         remark_data.append({
                             "region": remark,
-                            "data": remark_content
+                            "data": deduplicated_content
                         })
+
+                # 对备注列表进行全局去重（基于内容）
+                remark_data = self._deduplicate_remarks_list(remark_data)
 
                 if parse_result.get("has_sub_tables"):
                     for sub_tab in parse_result.get("sub_tables", []):
@@ -544,7 +549,7 @@ class GeotechnicalParserSystem:
                         })
 
                 parsed_tables.append({
-                    "table_id": f"T_{idx+1:04d}_{sub_idx+1}",
+                    "table_id": f"T_{idx + 1:04d}_{sub_idx + 1}",
                     "original_data": merged_table,
                     "parse_result": parse_result,
                     "main_table": main_table_data,
@@ -555,7 +560,8 @@ class GeotechnicalParserSystem:
                         "cols": max(len(r) for r in merged_table) if merged_table else 0
                     }
                 })
-                print(f"        子表格 {sub_idx+1}: {len(merged_table)}行, 主表: {parse_result.get('has_main_table')}, 备注: {parse_result.get('has_remarks')}, 附表: {parse_result.get('has_sub_tables')}")
+                print(
+                    f"        子表格 {sub_idx + 1}: {len(merged_table)}行, 主表: {parse_result.get('has_main_table')}, 备注: {parse_result.get('has_remarks')}, 附表: {parse_result.get('has_sub_tables')}")
 
         return {
             "file_name": Path(file_path).name,
@@ -564,6 +570,144 @@ class GeotechnicalParserSystem:
             "text_count": len(text_paragraphs),
             "tables": parsed_tables
         }
+
+    def _deduplicate_remark_content(self, remark_content: List[List[str]]) -> List[List[str]]:
+        """对单个备注块的内容进行去重（去除内部重复的单元格和行）"""
+        if not remark_content:
+            return remark_content
+
+        # 第一步：对每一行内的重复单元格进行去重
+        deduplicated_rows = []
+        for row in remark_content:
+            # 去除行内重复的单元格（保留顺序，但去除相邻重复）
+            unique_cells = []
+            prev_cell = None
+            for cell in row:
+                cell_clean = cell.strip() if cell else ""
+                if cell_clean and cell_clean != prev_cell:
+                    unique_cells.append(cell)
+                    prev_cell = cell_clean
+                elif not cell_clean:
+                    unique_cells.append(cell)
+            deduplicated_rows.append(unique_cells)
+
+        # 第二步：去除完全相同的行
+        unique_rows = []
+        seen_row_strs = set()
+        for row in deduplicated_rows:
+            # 将行转换为字符串用于比较（忽略空单元格）
+            row_str = " | ".join([str(cell) for cell in row if cell and cell.strip()])
+            if row_str and row_str not in seen_row_strs:
+                seen_row_strs.add(row_str)
+                unique_rows.append(row)
+            elif not row_str and not any(cell for cell in row):
+                # 空行跳过
+                continue
+            else:
+                # 重复行，跳过
+                continue
+
+        # 第三步：合并多行备注内容（如果内容连续且相似）
+        if len(unique_rows) > 1:
+            merged_rows = []
+            current_merged = []
+            for row in unique_rows:
+                row_text = " ".join([str(cell) for cell in row if cell and cell.strip()])
+                if current_merged:
+                    last_text = " ".join([str(cell) for cell in current_merged[-1] if cell and cell.strip()])
+                    # 如果当前行是上一行的延续（不以数字开头或不是新条目）
+                    if row_text and not re.match(r'^\d+[、.]', row_text):
+                        # 合并到上一行
+                        current_merged[-1] = [current_merged[-1][0] + " " + row_text] if current_merged[-1] else [
+                            row_text]
+                    else:
+                        current_merged.append(row)
+                else:
+                    current_merged.append(row)
+            unique_rows = current_merged
+
+        return unique_rows
+
+    def _deduplicate_remarks_list(self, remarks: List[Dict]) -> List[Dict]:
+        """对备注列表进行全局去重（基于内容相似度）"""
+        if not remarks:
+            return remarks
+
+        # 提取每个备注的内容文本
+        remark_texts = []
+        for remark in remarks:
+            data = remark.get("data", [])
+            # 将备注数据合并成文本，去重
+            text_parts = []
+            seen_phrases = set()
+            for row in data:
+                for cell in row:
+                    if cell and cell.strip():
+                        # 如果单元格内容过长，提取关键部分
+                        cell_clean = cell.strip()
+                        # 去除重复的段落（如相同内容重复出现）
+                        if cell_clean not in seen_phrases:
+                            seen_phrases.add(cell_clean)
+                            text_parts.append(cell_clean)
+            full_text = " ".join(text_parts)
+            remark_texts.append(full_text)
+
+        # 去重（内容相同或高度相似的只保留一个）
+        unique_remarks = []
+        unique_texts = []
+
+        for i, remark in enumerate(remarks):
+            text = remark_texts[i]
+            # 如果内容为空，跳过
+            if not text:
+                continue
+
+            # 检查是否与已有内容重复
+            is_duplicate = False
+            for j, existing_text in enumerate(unique_texts):
+                # 如果当前文本是已有文本的子串，或者已有文本是当前文本的子串
+                if text in existing_text or existing_text in text:
+                    is_duplicate = True
+                    # 保留内容更长的那个
+                    if len(text) > len(existing_text):
+                        unique_texts[j] = text
+                        unique_remarks[j] = remark
+                    break
+
+                # 计算相似度
+                min_len = min(len(text), len(existing_text))
+                if min_len > 50:
+                    common = self._longest_common_substring(text, existing_text)
+                    if common / min_len > 0.6:  # 60%相似度认为是重复
+                        is_duplicate = True
+                        break
+
+            if not is_duplicate:
+                unique_texts.append(text)
+                unique_remarks.append(remark)
+
+        return unique_remarks
+
+    def _longest_common_substring(self, s1: str, s2: str) -> int:
+        """计算两个字符串的最长公共子串长度"""
+        if not s1 or not s2:
+            return 0
+
+        len1, len2 = len(s1), len(s2)
+        # 使用较短的字符串作为内层循环
+        if len1 > len2:
+            s1, s2 = s2, s1
+            len1, len2 = len2, len1
+
+        max_len = 0
+        for i in range(len1):
+            for j in range(len2):
+                k = 0
+                while i + k < len1 and j + k < len2 and s1[i + k] == s2[j + k]:
+                    k += 1
+                if k > max_len:
+                    max_len = k
+        return max_len
 
 
 # ============================================================================
