@@ -268,7 +268,7 @@ class LLMTableParser:
     """基于大语言模型的表格解析器"""
 
     def __init__(self):
-        self.cache = {}
+        self.cache = {}  # 缓存相同结构表格的解析结果
 
     def _get_table_signature(self, table_data: List[List[str]]) -> str:
         """获取表格结构签名（用于判断是否为相同类型表格）"""
@@ -278,8 +278,10 @@ class LLMTableParser:
         rows = len(table_data)
         cols = max(len(row) for row in table_data) if table_data else 0
 
+        # 提取表头行
         header_row = table_data[0] if rows > 0 else []
 
+        # 签名 = 行数范围 + 列数 + 表头内容哈希
         row_range = "small" if rows < 20 else "medium" if rows < 50 else "large"
         header_hash = hashlib.md5("|".join(header_row).encode()).hexdigest()[:8]
 
@@ -288,6 +290,7 @@ class LLMTableParser:
     def _call_deepseek(self, table_data: List[List[str]]) -> Dict:
         """调用DeepSeek API解析表格 - 使用OpenAI SDK"""
 
+        # 将表格转换为文本表示
         table_text = []
         for i, row in enumerate(table_data):
             row_text = " | ".join([str(cell) if cell else "" for cell in row])
@@ -339,8 +342,11 @@ class LLMTableParser:
 注意：只返回JSON，不要有其他内容。行号和列号从0开始计数。"""
 
         print(f"  [DeepSeek请求] 表格大小: {len(table_data)}行 x {len(table_data[0]) if table_data else 0}列")
+        print(f"  [DeepSeek请求] Prompt长度: {len(prompt)}字符")
 
         try:
+            print(f"  [DeepSeek调用] 发送请求到 {DEEPSEEK_BASE_URL}")
+
             response = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
@@ -352,19 +358,28 @@ class LLMTableParser:
                 stream=False
             )
 
+            print(f"  [DeepSeek响应] 成功")
             content = response.choices[0].message.content
+            print(f"  [DeepSeek返回] 原始内容: {content[:500]}...")
+
+            # 提取JSON
             json_match = re.search(r'\{[\s\S]*\}', content)
             if json_match:
                 parsed = json.loads(json_match.group())
+                print(f"  [DeepSeek解析] 成功: has_main_table={parsed.get('has_main_table')}, has_remarks={parsed.get('has_remarks')}, has_sub_tables={parsed.get('has_sub_tables')}")
                 return parsed
             else:
+                print(f"  [DeepSeek错误] 无法从响应中提取JSON")
                 return self._get_default_parse_result(table_data)
 
         except Exception as e:
             print(f"  [DeepSeek异常] {e}")
+            import traceback
+            traceback.print_exc()
             return self._get_default_parse_result(table_data)
 
     def _get_default_parse_result(self, table_data: List[List[str]]) -> Dict:
+        """默认解析结果（API失败时的降级方案）"""
         rows = len(table_data)
         cols = max(len(row) for row in table_data) if table_data else 0
 
@@ -384,6 +399,7 @@ class LLMTableParser:
         }
 
     def parse(self, table_data: List[List[str]]) -> Dict:
+        """解析表格，返回主表/备注/附表的位置信息"""
         if not table_data:
             return {
                 "has_main_table": False,
@@ -394,15 +410,19 @@ class LLMTableParser:
                 "sub_tables": []
             }
 
+        # 获取表格签名
         signature = self._get_table_signature(table_data)
 
+        # 检查缓存
         if signature in self.cache:
             print(f"  [缓存命中] 使用相同结构表格的解析结果")
             return self.cache[signature]
 
+        # 调用大模型
         print(f"  [调用DeepSeek] 解析表格 {len(table_data)}行 x {len(table_data[0]) if table_data else 0}列")
         result = self._call_deepseek(table_data)
 
+        # 缓存结果
         self.cache[signature] = result
 
         return result
@@ -417,6 +437,7 @@ class TableExtractor:
 
     @staticmethod
     def extract_sub_table(table_data: List[List[str]], region: Dict) -> List[List[str]]:
+        """提取指定区域的子表格"""
         if not region:
             return []
 
@@ -425,6 +446,7 @@ class TableExtractor:
         start_col = region.get("start_col", 0)
         end_col = region.get("end_col", 0)
 
+        # 确保范围有效
         start_row = max(0, min(start_row, len(table_data) - 1))
         end_row = max(start_row, min(end_row, len(table_data) - 1))
         start_col = max(0, start_col)
@@ -443,40 +465,43 @@ class TableExtractor:
 
 
 # ============================================================================
-# 二次大模型解析器 - 新增功能，不影响原有逻辑
+# 二次大模型解析器 - 处理重复行/列和合并表头
 # ============================================================================
 
 class SecondaryLLMParser:
-    """二次大模型解析器 - 处理重复行/列和合并表头，独立于第一次解析"""
+    """二次大模型解析器 - 处理重复行/列和合并表头"""
 
     def __init__(self):
-        self.cache = {}
+        pass  # 不使用缓存，每次独立调用
 
-    def _get_table_signature(self, table_data: List[List[str]]) -> str:
-        if not table_data:
-            return ""
-        rows = len(table_data)
-        cols = max(len(row) for row in table_data) if table_data else 0
-        header_hash = hashlib.md5("|".join(table_data[0] if table_data else []).encode()).hexdigest()[:8]
-        return f"sec_{rows}_{cols}_{header_hash}"
-
-    def _call_deepseek_for_optimization(self, table_data: List[List[str]], table_type: str) -> Dict:
+    def _call_deepseek_for_optimization(self, table_data: List[List[str]], table_name: str) -> Dict:
         """调用DeepSeek API优化表格 - 处理重复行/列和合并表头"""
 
+        # 将表格转换为文本表示
         table_text = []
-        for i, row in enumerate(table_data[:50]):
+        for i, row in enumerate(table_data[:50]):  # 限制行数避免token过多
             row_text = " | ".join([str(cell) if cell else "" for cell in row])
             table_text.append(f"行{i}: {row_text}")
         table_str = "\n".join(table_text)
 
-        prompt = f"""你是一个岩土工程表格优化专家。请分析以下{table_type}表格数据，并进行优化处理。
+        prompt = f"""你是一个岩土工程表格优化专家。请分析以下表格（{table_name}），并进行优化处理。
 
 优化规则：
-1. **重复行处理**：识别并删除完全相同的重复行，保留第一次出现
+1. **重复行处理**：识别并删除完全相同的重复行（除表头外），保留第一次出现
 2. **重复列处理**：识别并删除完全相同的重复列（内容完全一致），保留第一次出现
 3. **合并表头处理**：识别表头中是否包含复合信息，需要智能拆分成独立列：
    - 检测表头中是否包含多个概念（如"杆塔号塔型"、"孔号孔深"、"地层编号时代成因"等）
    - 将复合表头拆分为独立的列名,其中塔型，成因等信息在原数据中若只有一个，则很大可能对应多行数据，也就是对应多个杆塔号或者编号。
+4.对于拆分表头后的所有表头需要进行对齐，如果没有单位，请忽略。如果有单位，以“数据（单位）”的格式进行重命名，如果不是非常确定，则保持原内容。
+5.只优化上面四项内容，其他无关信息请忽略。保持原数据不变。
+
+**请返回JSON格式结果，必须返回优化后的完整表格数据**。如果无需优化，返回原始表格。
+
+优化后的表格数据示例：
+{{
+    "has_optimization": true,
+    "optimization_type": []
+}}
 
 请返回JSON格式结果，**必须返回优化后的完整表格数据**：
 {{
@@ -507,6 +532,8 @@ class SecondaryLLMParser:
             )
 
             content = response.choices[0].message.content
+            print(f"  [二次解析响应] {content[:300]}...")
+
             json_match = re.search(r'\{[\s\S]*\}', content)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -526,8 +553,8 @@ class SecondaryLLMParser:
             "explanation": "无需优化"
         }
 
-    def optimize_table(self, table_data: List[List[str]], table_type: str) -> Dict:
-        """优化表格 - 返回优化结果"""
+    def optimize_table(self, table_data: List[List[str]], table_name: str) -> Dict:
+        """优化表格 - 每次独立调用大模型"""
         if not table_data or len(table_data) < 1:
             return {
                 "has_optimization": False,
@@ -535,21 +562,14 @@ class SecondaryLLMParser:
                 "explanation": "表格为空"
             }
 
-        signature = self._get_table_signature(table_data)
-        if signature in self.cache:
-            print(f"  [二次解析缓存命中]")
-            return self.cache[signature]
-
-        print(f"  [二次解析] 调用DeepSeek优化{table_type}表格 {len(table_data)}行 x {len(table_data[0]) if table_data else 0}列")
-        result = self._call_deepseek_for_optimization(table_data, table_type)
-
-        self.cache[signature] = result
+        print(f"  [二次解析] 调用DeepSeek优化{table_name}表格 {len(table_data)}行 x {len(table_data[0]) if table_data else 0}列")
+        result = self._call_deepseek_for_optimization(table_data, table_name)
 
         return result
 
 
 # ============================================================================
-# 主解析系统 - 原有逻辑完全不变，只新增二次解析结果的存储
+# 主解析系统 - 原有逻辑完全不变，只存储解析后的数据
 # ============================================================================
 
 class GeotechnicalParserSystem:
@@ -587,22 +607,24 @@ class GeotechnicalParserSystem:
         print("  步骤2: 按表头切分表格...")
         print("  步骤3: 对每个子表格合并相邻相同行列...")
         print("  步骤4: 大语言模型解析表格结构...")
-        print("  步骤5: 二次大语言模型优化（独立存储，不影响原始结果）...")
 
         parsed_tables = []
         for idx, table_data in enumerate(raw_tables):
             print(f"    处理表格 T_{idx + 1:04d}: 原始 {len(table_data)}行")
 
+            # 第一步：按表头切分
             split_tables = self.table_processor.split_by_header(table_data)
             print(f"      切分为 {len(split_tables)} 个独立表格")
 
             for sub_idx, sub_table in enumerate(split_tables):
+                # 第二步：合并相邻相同行和列
                 merged_rows = self.table_processor.merge_adjacent_rows(sub_table)
                 merged_table = self.table_processor.merge_adjacent_cols(merged_rows)
 
-                # 第一次解析：完全保持原有逻辑
+                # 第三步：大语言模型解析表格结构
                 parse_result = self.llm_parser.parse(merged_table)
 
+                # 第四步：根据解析结果提取子表格
                 main_table_data = []
                 remark_data = []
                 sub_table_data = []
@@ -615,12 +637,14 @@ class GeotechnicalParserSystem:
                 if parse_result.get("has_remarks"):
                     for remark in parse_result.get("remarks", []):
                         remark_content = self.table_extractor.extract_sub_table(merged_table, remark)
+                        # 对备注内容进行去重处理
                         deduplicated_content = self._deduplicate_remark_content(remark_content)
                         remark_data.append({
                             "region": remark,
                             "data": deduplicated_content
                         })
 
+                # 对备注列表进行全局去重（基于内容）
                 remark_data = self._deduplicate_remarks_list(remark_data)
 
                 if parse_result.get("has_sub_tables"):
@@ -631,45 +655,14 @@ class GeotechnicalParserSystem:
                             "data": sub_content
                         })
 
-                # ========== 新增：二次解析（独立存储，不修改原有数据） ==========
-                secondary_results = {
-                    "main_table_optimized": None,
-                    "sub_tables_optimized": []
-                }
-
-                # 对主表进行二次优化
-                if main_table_data and len(main_table_data) > 0:
-                    opt_result = self.secondary_parser.optimize_table(main_table_data, "主表")
-                    secondary_results["main_table_optimized"] = {
-                        "original": main_table_data,
-                        "optimized": opt_result.get("optimized_table", main_table_data),
-                        "has_optimization": opt_result.get("has_optimization", False),
-                        "optimization_type": opt_result.get("optimization_type", []),
-                        "explanation": opt_result.get("explanation", "")
-                    }
-
-                # 对附表进行二次优化
-                for sub_idx2, sub_tab in enumerate(sub_table_data):
-                    sub_content = sub_tab.get("data", [])
-                    if sub_content and len(sub_content) > 0:
-                        opt_result = self.secondary_parser.optimize_table(sub_content, f"附表{sub_idx2 + 1}")
-                        secondary_results["sub_tables_optimized"].append({
-                            "sub_table_index": sub_idx2,
-                            "original": sub_content,
-                            "optimized": opt_result.get("optimized_table", sub_content),
-                            "has_optimization": opt_result.get("has_optimization", False),
-                            "optimization_type": opt_result.get("optimization_type", []),
-                            "explanation": opt_result.get("explanation", "")
-                        })
-
                 parsed_tables.append({
                     "table_id": f"T_{idx + 1:04d}_{sub_idx + 1}",
-                    "original_data": merged_table,  # 原始数据不变
-                    "parse_result": parse_result,   # 第一次解析结果不变
-                    "main_table": main_table_data,  # 第一次解析的主表不变
-                    "remarks": remark_data,         # 备注不变
-                    "sub_tables": sub_table_data,   # 第一次解析的附表不变
-                    "secondary_optimization": secondary_results,  # 新增：二次优化结果（单独存储）
+                    "original_data": merged_table,
+                    "parse_result": parse_result,
+                    "main_table": main_table_data,
+                    "remarks": remark_data,
+                    "sub_tables": sub_table_data,
+                    "secondary_optimized": None,  # 二次优化结果，初始为空
                     "metadata": {
                         "rows": len(merged_table),
                         "cols": max(len(r) for r in merged_table) if merged_table else 0
@@ -687,11 +680,14 @@ class GeotechnicalParserSystem:
         }
 
     def _deduplicate_remark_content(self, remark_content: List[List[str]]) -> List[List[str]]:
+        """对单个备注块的内容进行去重（去除内部重复的单元格和行）"""
         if not remark_content:
             return remark_content
 
+        # 第一步：对每一行内的重复单元格进行去重
         deduplicated_rows = []
         for row in remark_content:
+            # 去除行内重复的单元格（保留顺序，但去除相邻重复）
             unique_cells = []
             prev_cell = None
             for cell in row:
@@ -703,18 +699,23 @@ class GeotechnicalParserSystem:
                     unique_cells.append(cell)
             deduplicated_rows.append(unique_cells)
 
+        # 第二步：去除完全相同的行
         unique_rows = []
         seen_row_strs = set()
         for row in deduplicated_rows:
+            # 将行转换为字符串用于比较（忽略空单元格）
             row_str = " | ".join([str(cell) for cell in row if cell and cell.strip()])
             if row_str and row_str not in seen_row_strs:
                 seen_row_strs.add(row_str)
                 unique_rows.append(row)
             elif not row_str and not any(cell for cell in row):
+                # 空行跳过
                 continue
             else:
+                # 重复行，跳过
                 continue
 
+        # 第三步：合并多行备注内容（如果内容连续且相似）
         if len(unique_rows) > 1:
             merged_rows = []
             current_merged = []
@@ -722,8 +723,11 @@ class GeotechnicalParserSystem:
                 row_text = " ".join([str(cell) for cell in row if cell and cell.strip()])
                 if current_merged:
                     last_text = " ".join([str(cell) for cell in current_merged[-1] if cell and cell.strip()])
+                    # 如果当前行是上一行的延续（不以数字开头或不是新条目）
                     if row_text and not re.match(r'^\d+[、.]', row_text):
-                        current_merged[-1] = [current_merged[-1][0] + " " + row_text] if current_merged[-1] else [row_text]
+                        # 合并到上一行
+                        current_merged[-1] = [current_merged[-1][0] + " " + row_text] if current_merged[-1] else [
+                            row_text]
                     else:
                         current_merged.append(row)
                 else:
@@ -733,45 +737,56 @@ class GeotechnicalParserSystem:
         return unique_rows
 
     def _deduplicate_remarks_list(self, remarks: List[Dict]) -> List[Dict]:
+        """对备注列表进行全局去重（基于内容相似度）"""
         if not remarks:
             return remarks
 
+        # 提取每个备注的内容文本
         remark_texts = []
         for remark in remarks:
             data = remark.get("data", [])
+            # 将备注数据合并成文本，去重
             text_parts = []
             seen_phrases = set()
             for row in data:
                 for cell in row:
                     if cell and cell.strip():
+                        # 如果单元格内容过长，提取关键部分
                         cell_clean = cell.strip()
+                        # 去除重复的段落（如相同内容重复出现）
                         if cell_clean not in seen_phrases:
                             seen_phrases.add(cell_clean)
                             text_parts.append(cell_clean)
             full_text = " ".join(text_parts)
             remark_texts.append(full_text)
 
+        # 去重（内容相同或高度相似的只保留一个）
         unique_remarks = []
         unique_texts = []
 
         for i, remark in enumerate(remarks):
             text = remark_texts[i]
+            # 如果内容为空，跳过
             if not text:
                 continue
 
+            # 检查是否与已有内容重复
             is_duplicate = False
             for j, existing_text in enumerate(unique_texts):
+                # 如果当前文本是已有文本的子串，或者已有文本是当前文本的子串
                 if text in existing_text or existing_text in text:
                     is_duplicate = True
+                    # 保留内容更长的那个
                     if len(text) > len(existing_text):
                         unique_texts[j] = text
                         unique_remarks[j] = remark
                     break
 
+                # 计算相似度
                 min_len = min(len(text), len(existing_text))
                 if min_len > 50:
                     common = self._longest_common_substring(text, existing_text)
-                    if common / min_len > 0.6:
+                    if common / min_len > 0.6:  # 60%相似度认为是重复
                         is_duplicate = True
                         break
 
@@ -782,10 +797,12 @@ class GeotechnicalParserSystem:
         return unique_remarks
 
     def _longest_common_substring(self, s1: str, s2: str) -> int:
+        """计算两个字符串的最长公共子串长度"""
         if not s1 or not s2:
             return 0
 
         len1, len2 = len(s1), len(s2)
+        # 使用较短的字符串作为内层循环
         if len1 > len2:
             s1, s2 = s2, s1
             len1, len2 = len2, len1
@@ -905,6 +922,132 @@ def get_result(task_id):
         return jsonify({"error": task.error}), 500
     else:
         return jsonify({"status": task.status, "progress": task.progress}), 202
+
+
+@app.route('/api/optimize/<task_id>/<int:table_index>', methods=['POST'])
+def optimize_single_table(task_id, table_index):
+    """对单个表格进行二次优化"""
+    if task_id not in tasks:
+        return jsonify({"error": "任务不存在"}), 404
+
+    task = tasks[task_id]
+    if task.status != "completed" or not task.result:
+        return jsonify({"error": "任务未完成"}), 400
+
+    try:
+        data = request.get_json()
+        table_name = data.get('table_name', f'表格{table_index}')
+
+        # 获取指定表格
+        tables = task.result.get('tables', [])
+        if table_index >= len(tables):
+            return jsonify({"error": "表格索引无效"}), 400
+
+        table = tables[table_index]
+
+        # 获取需要优化的表格数据（主表和附表）
+        main_table = table.get('main_table', [])
+        sub_tables = table.get('sub_tables', [])
+
+        optimization_result = {
+            "main_table_optimized": None,
+            "sub_tables_optimized": []
+        }
+
+        # 优化主表
+        if main_table and len(main_table) > 0:
+            opt_result = parser_system.secondary_parser.optimize_table(main_table, f"{table_name}主表")
+            optimization_result["main_table_optimized"] = {
+                "optimized": opt_result.get("optimized_table", main_table),
+                "has_optimization": opt_result.get("has_optimization", False),
+                "optimization_type": opt_result.get("optimization_type", []),
+                "explanation": opt_result.get("explanation", "")
+            }
+
+        # 优化附表
+        for sub_idx, sub_tab in enumerate(sub_tables):
+            sub_data = sub_tab.get('data', [])
+            if sub_data and len(sub_data) > 0:
+                opt_result = parser_system.secondary_parser.optimize_table(sub_data, f"{table_name}附表{sub_idx + 1}")
+                optimization_result["sub_tables_optimized"].append({
+                    "sub_table_index": sub_idx,
+                    "optimized": opt_result.get("optimized_table", sub_data),
+                    "has_optimization": opt_result.get("has_optimization", False),
+                    "optimization_type": opt_result.get("optimization_type", []),
+                    "explanation": opt_result.get("explanation", "")
+                })
+
+        # 保存优化结果
+        tables[table_index]["secondary_optimized"] = optimization_result
+
+        return jsonify({
+            "success": True,
+            "table_index": table_index,
+            "optimization_result": optimization_result
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/optimize_all/<task_id>', methods=['POST'])
+def optimize_all_tables(task_id):
+    """对所有表格进行二次优化"""
+    if task_id not in tasks:
+        return jsonify({"error": "任务不存在"}), 404
+
+    task = tasks[task_id]
+    if task.status != "completed" or not task.result:
+        return jsonify({"error": "任务未完成"}), 400
+
+    try:
+        tables = task.result.get('tables', [])
+
+        for table_idx, table in enumerate(tables):
+            table_name = table.get('table_id', f'表格{table_idx}')
+
+            # 获取需要优化的表格数据
+            main_table = table.get('main_table', [])
+            sub_tables = table.get('sub_tables', [])
+
+            optimization_result = {
+                "main_table_optimized": None,
+                "sub_tables_optimized": []
+            }
+
+            # 优化主表
+            if main_table and len(main_table) > 0:
+                opt_result = parser_system.secondary_parser.optimize_table(main_table, f"{table_name}主表")
+                optimization_result["main_table_optimized"] = {
+                    "optimized": opt_result.get("optimized_table", main_table),
+                    "has_optimization": opt_result.get("has_optimization", False),
+                    "optimization_type": opt_result.get("optimization_type", []),
+                    "explanation": opt_result.get("explanation", "")
+                }
+
+            # 优化附表
+            for sub_idx, sub_tab in enumerate(sub_tables):
+                sub_data = sub_tab.get('data', [])
+                if sub_data and len(sub_data) > 0:
+                    opt_result = parser_system.secondary_parser.optimize_table(sub_data, f"{table_name}附表{sub_idx + 1}")
+                    optimization_result["sub_tables_optimized"].append({
+                        "sub_table_index": sub_idx,
+                        "optimized": opt_result.get("optimized_table", sub_data),
+                        "has_optimization": opt_result.get("has_optimization", False),
+                        "optimization_type": opt_result.get("optimization_type", []),
+                        "explanation": opt_result.get("explanation", "")
+                    })
+
+            # 保存优化结果
+            tables[table_idx]["secondary_optimized"] = optimization_result
+
+        return jsonify({
+            "success": True,
+            "optimized_count": len([t for t in tables if t.get("secondary_optimized")])
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 def init_parser():
