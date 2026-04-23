@@ -14,6 +14,7 @@ from collections import defaultdict
 import threading
 import warnings
 import hashlib
+from table_header_alignment import get_header_aligner, align_table_headers, align_and_merge_units
 
 warnings.filterwarnings('ignore')
 
@@ -297,55 +298,94 @@ class LLMTableParser:
             table_text.append(f"行{i}: {row_text}")
         table_str = "\n".join(table_text)
 
-        prompt = f"""你是一个岩土工程表格解析专家。请分析以下表格，识别出表格中的"主表"、"备注"和"附表"。
+        prompt = f"""你是岩土工程表格解析专家。分析表格，将每个单元格互斥地划分为"主表"、"附表"或"备注"。
 
-解析规则：
-1. 主表：表格的主要内容，通常是包含表头和数据行的核心表格。主表应该有明确的列名和数据行。
-2. 备注：表格中包含的键值对信息（如"地下水深度：未见"），或对整个表格起作用的说明文字。
-3. 附表：当一个主表无法完全解析表格时，需要拆分成多个子表的情况。
+        【优先级】备注 > 主表 > 附表
 
-请返回JSON格式结果，格式如下：
-{{
-    "has_main_table": true/false,
-    "main_table": {{
-        "start_row": 起始行号,
-        "end_row": 结束行号,
-        "start_col": 起始列号,
-        "end_col": 结束列号,
-        "description": "表格描述"
-    }},
-    "has_remarks": true/false,
-    "remarks": [
+        【判断标准】
+
+        1. **备注**：说明性文字
+           - 键值对格式（如"参数: 值"）
+           - 以"建议"、"说明"、"注"、"备注"开头
+           - 大段文本（>20字符）或包含换行符\\n
+           - 相邻列内容相同（被切分的备注单元格）
+
+        2. **主表**：核心结构化数据
+           - 包含岩土关键参数：孔号、孔深、土层编号、含水量、孔隙比、液限、塑限、压缩模量、黏聚力、内摩擦角等
+           - 有明确的表头和数据行（数字/短文本）
+           - 通常位于表格左侧/顶部，数据行数最多
+
+        3. **附表**：仅在主表无法覆盖时才使用
+           - 主表之外另起的结构化数据区域
+           - 有独立的表头和数据行
+           - **非必要不使用附表，优先将区域归入主表**
+
+        【输出格式】
         {{
-            "start_row": 起始行号,
-            "end_row": 结束行号,
-            "start_col": 起始列号,
-            "end_col": 结束列号,
-            "content": "备注内容"
+            "has_main_table": true/false,
+            "main_table": {{
+                "start_row": 0,
+                "end_row": 行数-1,
+                "start_col": 0,
+                "end_col": 列数-1,
+                "headers": [{{"col_index": 0, "start_col": 0, "end_col": 0, "header_name": "表头名"}}],
+                "description": "描述"
+            }},
+            "has_sub_tables": true/false,
+            "sub_tables": [
+                {{
+                    "start_row": 起始行,
+                    "end_row": 结束行,
+                    "start_col": 起始列,
+                    "end_col": 结束列,
+                    "headers": [{{"col_index": 0, "start_col": 0, "end_col": 0, "header_name": "表头名"}}],
+                    "description": "描述"
+                }}
+            ],
+            "has_remarks": true/false,
+            "remarks": [
+                {{
+                    "start_row": 起始行,
+                    "end_row": 结束行,
+                    "start_col": 起始列,
+                    "end_col": 结束列,
+                    "content": "备注摘要"
+                }}
+            ]
         }}
-    ],
-    "has_sub_tables": true/false,
-    "sub_tables": [
-        {{
-            "start_row": 起始行号,
-            "end_row": 结束行号,
-            "start_col": 起始列号,
-            "end_col": 结束列号,
-            "description": "子表描述"
-        }}
-    ]
-}}
 
-表格数据：
-{table_str}
+        【规则】
+        - 行号和列号从0开始
+        - 每个表格必须有且只有一个主表
+        - 附表是非必要的，仅在主表确实无法覆盖时才使用
+        - 备注列若相邻内容相同则合并为同一备注区域
 
-注意：只返回JSON，不要有其他内容。行号和列号从0开始计数。"""
+        表格数据：
+        {table_str}
 
-        print(f"  [DeepSeek请求] 表格大小: {len(table_data)}行 x {len(table_data[0]) if table_data else 0}列")
-        print(f"  [DeepSeek请求] Prompt长度: {len(prompt)}字符")
+        只返回JSON。"""
+
+        # 输出大模型输入
+        print("\n[第一次优化 - 大模型输入]")
+        print("-" * 80)
+        print(f"表格大小: {len(table_data)}行 x {len(table_data[0]) if table_data else 0}列")
+        print(f"\n原始表格数据（完整显示）:")
+        for i, row in enumerate(table_data):
+            # 显示每行的前10列，避免输出过长
+            display_row = row[:10] if len(row) > 10 else row
+            if len(row) > 10:
+                print(f"  行{i}: {display_row}... (共{len(row)}列)")
+            else:
+                print(f"  行{i}: {display_row}")
+        print(f"\n完整Prompt:")
+        print(prompt)
+        print(f"\nPrompt长度: {len(prompt)}字符")
+        print("-" * 80)
 
         try:
-            print(f"  [DeepSeek调用] 发送请求到 {DEEPSEEK_BASE_URL}")
+            print(f"\n[第一次优化 - API调用] 发送请求到 {DEEPSEEK_BASE_URL}")
+            print(f"[第一次优化 - API调用] 模型: deepseek-chat")
+            print(f"[第一次优化 - API调用] temperature: 0.1, max_tokens: 2000")
 
             response = client.chat.completions.create(
                 model="deepseek-chat",
@@ -358,30 +398,108 @@ class LLMTableParser:
                 stream=False
             )
 
-            print(f"  [DeepSeek响应] 成功")
             content = response.choices[0].message.content
-            print(f"  [DeepSeek返回] 原始内容: {content[:500]}...")
+
+            # 输出大模型输出
+            print("\n[第一次优化 - 大模型输出]")
+            print("-" * 80)
+            print(f"响应状态: 成功")
+            print(f"响应长度: {len(content)}字符")
+            print(f"使用tokens: {response.usage.total_tokens if hasattr(response, 'usage') else 'N/A'}")
+            print(f"\n原始响应内容:")
+            print(content)
+            print("-" * 80)
 
             # 提取JSON
             json_match = re.search(r'\{[\s\S]*\}', content)
             if json_match:
                 parsed = json.loads(json_match.group())
-                print(f"  [DeepSeek解析] 成功: has_main_table={parsed.get('has_main_table')}, has_remarks={parsed.get('has_remarks')}, has_sub_tables={parsed.get('has_sub_tables')}")
+
+                # 输出解析结果
+                print("\n[第一次优化 - 解析结果]")
+                print("-" * 80)
+                print(f"✓ has_main_table: {parsed.get('has_main_table')}")
+                if parsed.get('has_main_table'):
+                    main_table = parsed.get('main_table', {})
+                    print(
+                        f"  └─ main_table: 行{main_table.get('start_row')}-{main_table.get('end_row')}, 列{main_table.get('start_col')}-{main_table.get('end_col')}")
+                    print(f"     description: {main_table.get('description')}")
+                    # 输出headers信息
+                    headers = main_table.get('headers', [])
+                    if headers:
+                        print(f"     表头信息 ({len(headers)}列):")
+                        for header in headers:
+                            print(
+                                f"       列{header.get('col_index')}: [{header.get('start_col')}-{header.get('end_col')}] {header.get('header_name')}")
+                    else:
+                        print(f"     警告: 未返回headers信息")
+
+                print(f"✓ has_remarks: {parsed.get('has_remarks')}")
+                if parsed.get('has_remarks'):
+                    remarks = parsed.get('remarks', [])
+                    print(f"  └─ 共{len(remarks)}个备注区域:")
+                    for i, remark in enumerate(remarks):
+                        print(
+                            f"     备注{i + 1}: 行{remark.get('start_row')}-{remark.get('end_row')}, 列{remark.get('start_col')}-{remark.get('end_col')}")
+                        content_preview = remark.get('content', '')[:100]
+                        print(
+                            f"        content: {content_preview}{'...' if len(remark.get('content', '')) > 100 else ''}")
+
+                print(f"✓ has_sub_tables: {parsed.get('has_sub_tables')}")
+                if parsed.get('has_sub_tables'):
+                    sub_tables = parsed.get('sub_tables', [])
+                    print(f"  └─ 共{len(sub_tables)}个附表区域:")
+                    for i, sub_tab in enumerate(sub_tables):
+                        print(
+                            f"     附表{i + 1}: 行{sub_tab.get('start_row')}-{sub_tab.get('end_row')}, 列{sub_tab.get('start_col')}-{sub_tab.get('end_col')}")
+                        print(f"        description: {sub_tab.get('description')}")
+                        # 输出headers信息
+                        headers = sub_tab.get('headers', [])
+                        if headers:
+                            print(f"        表头信息 ({len(headers)}列):")
+                            for header in headers:
+                                print(
+                                    f"          列{header.get('col_index')}: [{header.get('start_col')}-{header.get('end_col')}] {header.get('header_name')}")
+                        else:
+                            print(f"        警告: 未返回headers信息")
+
+                print("=" * 80 + "\n")
                 return parsed
             else:
-                print(f"  [DeepSeek错误] 无法从响应中提取JSON")
+                print("\n[第一次优化 - 错误]")
+                print("-" * 80)
+                print("✗ 无法从响应中提取JSON")
+                print(f"响应内容前500字符: {content[:500]}")
+                print("=" * 80 + "\n")
                 return self._get_default_parse_result(table_data)
 
         except Exception as e:
-            print(f"  [DeepSeek异常] {e}")
+            print("\n[第一次优化 - 异常]")
+            print("-" * 80)
+            print(f"✗ 异常类型: {type(e).__name__}")
+            print(f"✗ 异常信息: {e}")
             import traceback
+            print(f"\n完整堆栈跟踪:")
             traceback.print_exc()
+            print("=" * 80 + "\n")
             return self._get_default_parse_result(table_data)
 
     def _get_default_parse_result(self, table_data: List[List[str]]) -> Dict:
         """默认解析结果（API失败时的降级方案）"""
         rows = len(table_data)
         cols = max(len(row) for row in table_data) if table_data else 0
+
+        # 构建默认headers
+        default_headers = []
+        if rows > 0 and table_data[0]:
+            for j in range(cols):
+                header_name = table_data[0][j] if j < len(table_data[0]) else f"列{j}"
+                default_headers.append({
+                    "col_index": j,
+                    "start_col": j,
+                    "end_col": j,
+                    "header_name": header_name
+                })
 
         return {
             "has_main_table": True,
@@ -390,6 +508,7 @@ class LLMTableParser:
                 "end_row": rows - 1,
                 "start_col": 0,
                 "end_col": cols - 1,
+                "headers": default_headers,
                 "description": "整个表格"
             },
             "has_remarks": False,
@@ -435,6 +554,123 @@ class LLMTableParser:
 class TableExtractor:
     """根据LLM解析结果提取子表格"""
 
+    @staticmethod
+    def extract_sub_table(table_data: List[List[str]], region: Dict) -> List[List[str]]:
+        """提取指定区域的子表格"""
+        if not region:
+            return []
+
+        start_row = region.get("start_row", 0)
+        end_row = region.get("end_row", len(table_data) - 1)
+        start_col = region.get("start_col", 0)
+        end_col = region.get("end_col", 0)
+
+        start_row = max(0, min(start_row, len(table_data) - 1))
+        end_row = max(start_row, min(end_row, len(table_data) - 1))
+        start_col = max(0, start_col)
+        end_col = max(start_col, end_col)
+
+        result = []
+        for i in range(start_row, end_row + 1):
+            if i < len(table_data):
+                row = table_data[i]
+                if start_col < len(row):
+                    result.append(row[start_col:min(end_col + 1, len(row))])
+                else:
+                    result.append([])
+
+        return result
+
+    @staticmethod
+    def fix_remark_boundary(table_data: List[List[str]], parse_result: Dict) -> Dict:
+        """修正备注边界：将包含备注内容的列从附表中移除"""
+
+        # 获取备注区域
+        remarks = parse_result.get("remarks", [])
+        if not remarks:
+            return parse_result
+
+        # 获取附表区域
+        sub_tables = parse_result.get("sub_tables", [])
+        if not sub_tables:
+            return parse_result
+
+        # 对于每个附表，检查其起始列是否包含备注内容
+        for sub_tab in sub_tables:
+            sub_start_col = sub_tab.get("start_col", 0)
+            sub_start_row = sub_tab.get("start_row", 0)
+
+            # 检查附表起始列在表头行（sub_start_row）的内容
+            if sub_start_row < len(table_data) and sub_start_col < len(table_data[sub_start_row]):
+                cell_content = table_data[sub_start_row][sub_start_col]
+
+                # 判断是否为备注内容（包含换行符、长度>50、包含"建议"等关键词）
+                is_remark = False
+                if cell_content:
+                    if '\n' in cell_content:
+                        is_remark = True
+                    elif len(cell_content) > 50:
+                        is_remark = True
+                    elif any(keyword in cell_content for keyword in ['建议', '说明', '注', '备注']):
+                        is_remark = True
+
+                # 如果是备注内容，调整附表的起始列
+                if is_remark:
+                    # 找到第一个非备注内容的列
+                    new_start_col = sub_start_col + 1
+                    while new_start_col < len(table_data[sub_start_row]):
+                        next_cell = table_data[sub_start_row][new_start_col]
+                        is_next_remark = False
+                        if next_cell:
+                            if '\n' in next_cell:
+                                is_next_remark = True
+                            elif len(next_cell) > 50:
+                                is_next_remark = True
+                            elif any(keyword in next_cell for keyword in ['建议', '说明', '注', '备注']):
+                                is_next_remark = True
+
+                        if not is_next_remark:
+                            break
+                        new_start_col += 1
+
+                    # 更新附表的起始列
+                    sub_tab["start_col"] = new_start_col
+
+                    # 更新附表的headers
+                    old_headers = sub_tab.get("headers", [])
+                    new_headers = []
+                    for header in old_headers:
+                        if header.get("col_index", 0) >= new_start_col:
+                            # 调整col_index
+                            header["col_index"] = header["col_index"] - (sub_start_col - new_start_col)
+                            new_headers.append(header)
+                    sub_tab["headers"] = new_headers
+
+                    # 将备注列合并到备注区域
+                    # 查找或创建包含这些列的备注区域
+                    remark_found = False
+                    for remark in remarks:
+                        if remark.get("start_row", 0) <= sub_start_row <= remark.get("end_row", 0):
+                            # 扩展备注区域的列范围
+                            remark["start_col"] = min(remark.get("start_col", sub_start_col), sub_start_col)
+                            remark["end_col"] = max(remark.get("end_col", sub_start_col), sub_start_col)
+                            remark_found = True
+                            break
+
+                    if not remark_found:
+                        # 创建新的备注区域
+                        remarks.append({
+                            "start_row": sub_start_row,
+                            "end_row": sub_start_row,
+                            "start_col": sub_start_col,
+                            "end_col": sub_start_col,
+                            "content": "备注内容"
+                        })
+
+        parse_result["remarks"] = remarks
+        parse_result["sub_tables"] = sub_tables
+
+        return parse_result
     @staticmethod
     def extract_sub_table(table_data: List[List[str]], region: Dict) -> List[List[str]]:
         """提取指定区域的子表格"""
@@ -594,6 +830,9 @@ class GeotechnicalParserSystem:
         print("\n[5] 初始化表格提取器...")
         self.table_extractor = TableExtractor()
 
+        print("\n[6] 初始化表头对齐器...")
+        self.header_aligner = get_header_aligner()
+
         print("\n✓ 系统初始化完成！")
 
     def parse_document(self, file_path: str) -> Dict:
@@ -624,7 +863,10 @@ class GeotechnicalParserSystem:
                 # 第三步：大语言模型解析表格结构
                 parse_result = self.llm_parser.parse(merged_table)
 
-                # 第四步：根据解析结果提取子表格
+                # 修正备注边界
+                parse_result = self.table_extractor.fix_remark_boundary(merged_table, parse_result)
+
+                # 第四步：根据解析结果提取子表格（不做表头对齐）
                 main_table_data = []
                 remark_data = []
                 sub_table_data = []
@@ -637,18 +879,16 @@ class GeotechnicalParserSystem:
                 if parse_result.get("has_remarks"):
                     for remark in parse_result.get("remarks", []):
                         remark_content = self.table_extractor.extract_sub_table(merged_table, remark)
-                        # 对备注内容进行去重处理
                         deduplicated_content = self._deduplicate_remark_content(remark_content)
                         remark_data.append({
                             "region": remark,
                             "data": deduplicated_content
                         })
 
-                # 对备注列表进行全局去重（基于内容）
                 remark_data = self._deduplicate_remarks_list(remark_data)
 
                 if parse_result.get("has_sub_tables"):
-                    for sub_tab in parse_result.get("sub_tables", []):
+                    for sub_tab_idx, sub_tab in enumerate(parse_result.get("sub_tables", [])):
                         sub_content = self.table_extractor.extract_sub_table(merged_table, sub_tab)
                         sub_table_data.append({
                             "region": sub_tab,
@@ -662,7 +902,7 @@ class GeotechnicalParserSystem:
                     "main_table": main_table_data,
                     "remarks": remark_data,
                     "sub_tables": sub_table_data,
-                    "secondary_optimized": None,  # 二次优化结果，初始为空
+                    "secondary_optimized": None,
                     "metadata": {
                         "rows": len(merged_table),
                         "cols": max(len(r) for r in merged_table) if merged_table else 0
@@ -847,14 +1087,16 @@ def process_document(task):
             task.result = result
             task.status = "completed"
             task.progress = 100
-        else:
-            task.status = "failed"
-            task.error = "解析器未初始化"
+
+            # 解析完成后删除原始文件
+            try:
+                os.remove(task.file_path)
+                print(f"已删除临时文件: {task.file_path}")
+            except Exception as e:
+                print(f"删除文件失败: {e}")
     except Exception as e:
         task.status = "failed"
         task.error = str(e)
-        import traceback
-        traceback.print_exc()
 
 
 def clean_for_json(obj):
@@ -926,7 +1168,7 @@ def get_result(task_id):
 
 @app.route('/api/optimize/<task_id>/<int:table_index>', methods=['POST'])
 def optimize_single_table(task_id, table_index):
-    """对单个表格进行二次优化"""
+    """对单个表格进行二次优化，优化后进行表头对齐"""
     if task_id not in tasks:
         return jsonify({"error": "任务不存在"}), 404
 
@@ -938,47 +1180,84 @@ def optimize_single_table(task_id, table_index):
         data = request.get_json()
         table_name = data.get('table_name', f'表格{table_index}')
 
-        # 获取指定表格
         tables = task.result.get('tables', [])
         if table_index >= len(tables):
             return jsonify({"error": "表格索引无效"}), 400
 
         table = tables[table_index]
+        aligner = get_header_aligner()
 
-        # 获取需要优化的表格数据（主表和附表）
         main_table = table.get('main_table', [])
         sub_tables = table.get('sub_tables', [])
 
         optimization_result = {
             "main_table_optimized": None,
-            "sub_tables_optimized": []
+            "sub_tables_optimized": [],
+            "header_alignment": {
+                "main_table": None,
+                "sub_tables": []
+            }
         }
 
         # 优化主表
         if main_table and len(main_table) > 0:
+            print(f"\n[二次优化] 开始优化主表: {table_name}")
             opt_result = parser_system.secondary_parser.optimize_table(main_table, f"{table_name}主表")
+            optimized_main = opt_result.get("optimized_table", main_table)
+
+            # 优化后进行表头对齐
+            print(f"[表头对齐] 对优化后的主表进行对齐...")
+            aligned_main, align_stats = aligner.align_table_headers(optimized_main)
+            aligned_main_with_units = aligner.align_and_merge_units(optimized_main)
+
             optimization_result["main_table_optimized"] = {
-                "optimized": opt_result.get("optimized_table", main_table),
+                "optimized": aligned_main_with_units,
                 "has_optimization": opt_result.get("has_optimization", False),
                 "optimization_type": opt_result.get("optimization_type", []),
-                "explanation": opt_result.get("explanation", "")
+                "explanation": opt_result.get("explanation", ""),
+                "header_alignment": {
+                    "stats": align_stats,
+                    "changes": [d for d in align_stats.get('details', []) if d['original'] != d['aligned']]
+                }
             }
 
         # 优化附表
         for sub_idx, sub_tab in enumerate(sub_tables):
             sub_data = sub_tab.get('data', [])
             if sub_data and len(sub_data) > 0:
+                print(f"\n[二次优化] 开始优化附表{sub_idx + 1}")
                 opt_result = parser_system.secondary_parser.optimize_table(sub_data, f"{table_name}附表{sub_idx + 1}")
+                optimized_sub = opt_result.get("optimized_table", sub_data)
+
+                # 优化后进行表头对齐
+                print(f"[表头对齐] 对优化后的附表{sub_idx + 1}进行对齐...")
+                aligned_sub, sub_align_stats = aligner.align_table_headers(optimized_sub)
+                aligned_sub_with_units = aligner.align_and_merge_units(optimized_sub)
+
                 optimization_result["sub_tables_optimized"].append({
                     "sub_table_index": sub_idx,
-                    "optimized": opt_result.get("optimized_table", sub_data),
+                    "optimized": aligned_sub_with_units,
                     "has_optimization": opt_result.get("has_optimization", False),
                     "optimization_type": opt_result.get("optimization_type", []),
-                    "explanation": opt_result.get("explanation", "")
+                    "explanation": opt_result.get("explanation", ""),
+                    "header_alignment": {
+                        "stats": sub_align_stats,
+                        "changes": [d for d in sub_align_stats.get('details', []) if d['original'] != d['aligned']]
+                    }
                 })
 
-        # 保存优化结果
         tables[table_index]["secondary_optimized"] = optimization_result
+
+        # 输出对齐结果摘要
+        print(f"\n[对齐结果摘要]")
+        if optimization_result["main_table_optimized"]:
+            stats = optimization_result["main_table_optimized"].get("header_alignment", {}).get("stats", {})
+            print(
+                f"  主表: 精确匹配={stats.get('matched', 0)}, 语义匹配={stats.get('semantic', 0)}, 保留={stats.get('original', 0)}")
+        for sub_opt in optimization_result["sub_tables_optimized"]:
+            stats = sub_opt.get("header_alignment", {}).get("stats", {})
+            print(
+                f"  附表{sub_opt['sub_table_index'] + 1}: 精确匹配={stats.get('matched', 0)}, 语义匹配={stats.get('semantic', 0)}, 保留={stats.get('original', 0)}")
 
         return jsonify({
             "success": True,
@@ -987,12 +1266,15 @@ def optimize_single_table(task_id, table_index):
         })
 
     except Exception as e:
+        print(f"[错误] {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/optimize_all/<task_id>', methods=['POST'])
 def optimize_all_tables(task_id):
-    """对所有表格进行二次优化"""
+    """对所有表格进行二次优化，优化后进行表头对齐"""
     if task_id not in tasks:
         return jsonify({"error": "任务不存在"}), 404
 
@@ -1002,53 +1284,89 @@ def optimize_all_tables(task_id):
 
     try:
         tables = task.result.get('tables', [])
+        aligner = get_header_aligner()
+        optimized_count = 0
 
         for table_idx, table in enumerate(tables):
             table_name = table.get('table_id', f'表格{table_idx}')
 
-            # 获取需要优化的表格数据
             main_table = table.get('main_table', [])
             sub_tables = table.get('sub_tables', [])
 
             optimization_result = {
                 "main_table_optimized": None,
-                "sub_tables_optimized": []
+                "sub_tables_optimized": [],
+                "header_alignment": {
+                    "main_table": None,
+                    "sub_tables": []
+                }
             }
+
+            has_any_optimization = False
 
             # 优化主表
             if main_table and len(main_table) > 0:
                 opt_result = parser_system.secondary_parser.optimize_table(main_table, f"{table_name}主表")
+                optimized_main = opt_result.get("optimized_table", main_table)
+
+                # 表头对齐
+                aligned_main, align_stats = aligner.align_table_headers(optimized_main)
+                aligned_main_with_units = aligner.align_and_merge_units(optimized_main)
+
                 optimization_result["main_table_optimized"] = {
-                    "optimized": opt_result.get("optimized_table", main_table),
+                    "optimized": aligned_main_with_units,
                     "has_optimization": opt_result.get("has_optimization", False),
                     "optimization_type": opt_result.get("optimization_type", []),
-                    "explanation": opt_result.get("explanation", "")
+                    "explanation": opt_result.get("explanation", ""),
+                    "header_alignment": {
+                        "stats": align_stats,
+                        "changes": [d for d in align_stats.get('details', []) if d['original'] != d['aligned']]
+                    }
                 }
+                if opt_result.get("has_optimization"):
+                    has_any_optimization = True
 
             # 优化附表
             for sub_idx, sub_tab in enumerate(sub_tables):
                 sub_data = sub_tab.get('data', [])
                 if sub_data and len(sub_data) > 0:
-                    opt_result = parser_system.secondary_parser.optimize_table(sub_data, f"{table_name}附表{sub_idx + 1}")
+                    opt_result = parser_system.secondary_parser.optimize_table(sub_data,
+                                                                               f"{table_name}附表{sub_idx + 1}")
+                    optimized_sub = opt_result.get("optimized_table", sub_data)
+
+                    # 表头对齐
+                    aligned_sub, sub_align_stats = aligner.align_table_headers(optimized_sub)
+                    aligned_sub_with_units = aligner.align_and_merge_units(optimized_sub)
+
                     optimization_result["sub_tables_optimized"].append({
                         "sub_table_index": sub_idx,
-                        "optimized": opt_result.get("optimized_table", sub_data),
+                        "optimized": aligned_sub_with_units,
                         "has_optimization": opt_result.get("has_optimization", False),
                         "optimization_type": opt_result.get("optimization_type", []),
-                        "explanation": opt_result.get("explanation", "")
+                        "explanation": opt_result.get("explanation", ""),
+                        "header_alignment": {
+                            "stats": sub_align_stats,
+                            "changes": [d for d in sub_align_stats.get('details', []) if d['original'] != d['aligned']]
+                        }
                     })
+                    if opt_result.get("has_optimization"):
+                        has_any_optimization = True
 
-            # 保存优化结果
+            if has_any_optimization:
+                optimized_count += 1
+
             tables[table_idx]["secondary_optimized"] = optimization_result
 
         return jsonify({
             "success": True,
-            "optimized_count": len([t for t in tables if t.get("secondary_optimized")])
+            "optimized_count": optimized_count
         })
 
     except Exception as e:
+        print(f"[错误] {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 def init_parser():
     global parser_system
