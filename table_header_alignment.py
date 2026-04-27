@@ -404,13 +404,12 @@ class TableHeaderAligner:
 
     def __init__(self):
         self.library = GeotechnicalHeaderLibrary()
-        self.semantic_matcher = SemanticMatcher()
+        # self.semantic_matcher = SemanticMatcher()
 
         # 缓存对齐结果
         self.cache = {}
 
         print("表头对齐器初始化完成")
-        print(f"语义匹配可用: {self.semantic_matcher.is_available}")
 
     def align_header(self, raw_header: str, column_data: List[Any] = None) -> Dict:
         """
@@ -465,25 +464,25 @@ class TableHeaderAligner:
             return result
 
         # 2. 语义相似度匹配（如果关键词匹配不成功）
-        if self.semantic_matcher.is_available:
-            candidates = list(self.library.synonyms.keys())
-            best_match, sim_score = self.semantic_matcher.find_best_match(raw_header, candidates, threshold=0.5)
-
-            if best_match and sim_score > 0.5:
-                result["aligned"] = best_match
-                result["confidence"] = sim_score
-                result["match_type"] = "semantic"
-                result["validated"] = True
-
-                # 单位验证
-                if column_data and unit:
-                    is_valid, ratio = self.library.validate_unit_with_data(best_match, unit, column_data)
-                    result["validated"] = is_valid
-                    if not is_valid:
-                        result["warning"] = f"单位验证失败，仅{ratio:.0%}的数据在合理范围内"
-
-                self.cache[cache_key] = result
-                return result
+        # if self.semantic_matcher.is_available:
+        #     candidates = list(self.library.synonyms.keys())
+        #     best_match, sim_score = self.semantic_matcher.find_best_match(raw_header, candidates, threshold=0.5)
+        #
+        #     if best_match and sim_score > 0.5:
+        #         result["aligned"] = best_match
+        #         result["confidence"] = sim_score
+        #         result["match_type"] = "semantic"
+        #         result["validated"] = True
+        #
+        #         # 单位验证
+        #         if column_data and unit:
+        #             is_valid, ratio = self.library.validate_unit_with_data(best_match, unit, column_data)
+        #             result["validated"] = is_valid
+        #             if not is_valid:
+        #                 result["warning"] = f"单位验证失败，仅{ratio:.0%}的数据在合理范围内"
+        #
+        #         self.cache[cache_key] = result
+        #         return result
 
         # 3. 不成功，使用原表头
         result["confidence"] = confidence
