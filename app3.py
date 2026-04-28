@@ -9,6 +9,7 @@ import json
 import uuid
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
+from table_deduplicator import TableDeduplicator
 import threading
 import warnings
 import hashlib
@@ -711,7 +712,7 @@ class TableExtractor:
 # ============================================================================
 
 class SecondaryLLMParser:
-    """二次大模型解析器 - 处理重复行/列和合并表头"""
+    """二次大模型解析器 - 处理合并表头（重复行/列已通过硬编码去除）"""
 
     def __init__(self):
         self.model = LLM_CONFIG['model']
@@ -720,41 +721,93 @@ class SecondaryLLMParser:
         self.max_rows_for_prompt = LLM_CONFIG['max_table_rows_for_prompt']
 
     def _call_deepseek_for_optimization(self, table_data: List[List[str]], table_name: str) -> Dict:
-        """调用DeepSeek API优化表格"""
+        """调用DeepSeek API优化表格 - 只处理表头合并和单位对齐"""
         table_text = []
         for i, row in enumerate(table_data[:self.max_rows_for_prompt]):
             row_text = " | ".join([str(cell) if cell else "" for cell in row])
             table_text.append(f"行{i}: {row_text}")
         table_str = "\n".join(table_text)
 
+        # 修改提示词，去除重复行/列的处理要求
         prompt = f"""你是一个岩土工程表格优化专家。请分析以下表格（{table_name}），并进行优化处理。
 
-优化规则：
-1. **重复行处理**：识别并删除完全相同的重复行（除表头外），保留第一次出现
-2. **重复列处理**：识别并删除完全相同的重复列（内容完全一致），保留第一次出现
-3. **合并表头处理**：识别表头中是否包含复合信息，需要智能拆分成独立列
-4. 对于拆分表头后的所有表头需要进行对齐，如果没有单位，请忽略。如果有单位，以"数据（单位）"的格式进行重命名
+        【优化规则】
 
-**请返回JSON格式结果，必须返回优化后的完整表格数据**。
+        1. **拆分复合表头列**
+           - 识别表头单元格中包含多个独立概念的情况（如"A B"、"A-B"、"A\nB"、"A和B"等）
+           - 常见复合表头模式：
+             * "钻孔编号孔深" → ["钻孔编号", "孔深"]
+             * "杆塔号 塔型" → ["杆塔号", "塔型"]
+             * "地层编号-时代成因" → ["地层编号", "时代成因"]
+           - 拆分后，对应数据列按相同分隔符拆分成多个值
 
-原始表格数据：
-{table_str}
+        2. **跨行数据填充（合并分散数据）**
+           - 拆分复合列后，检查新列的数据分布情况
+           - 如果某一列满足以下条件：
+             * 大部分行（>70%）为空值
+             * 少数行（<30%）有非空值
+             * 这些有值的行，其他列的数据与某正常行重复
+           - 则执行跨行填充：
+             * 提取这些有值行的内容作为"公共值"
+             * 将公共值填充到该列的所有空行
+             * 删除这些有值的特殊行（因为数据已被提取）
 
-请返回JSON格式结果：
-{{
-    "has_optimization": true/false,
-    "optimization_type": ["duplicate_rows", "duplicate_cols", "merged_headers"],
-    "optimized_table": [["表头1", "表头2"], ["数据1", "数据2"]],
-    "explanation": "优化说明"
-}}
+           示例：
+           拆分前：
+             ["孔号孔深", "含水率"]
+             ["ZK1", "25.3"]
+             ["2.5m", "25.3"]    # 特殊行：只有孔深，孔号为空
+             ["ZK2", "26.1"]
 
-注意：只返回JSON。"""
+           拆分后：
+             ["孔号", "孔深", "含水率"]
+             ["ZK1", "", "25.3"]
+             ["", "2.5m", "25.3"]    # 特殊行
+             ["ZK2", "", "26.1"]
+
+           填充后：
+             ["孔号", "孔深", "含水率"]
+             ["ZK1", "2.5m", "25.3"]
+             ["ZK2", "2.5m", "26.1"]
+             (删除特殊行)
+
+        3. **表头标准化**
+           - 统一表头命名格式
+           - 如果数据中包含单位（如"25.3%"、"14kN/m³"），将单位提取到表头：`"数据值(单位)"`
+           - 示例：
+             * 列数据["14", "16", "15"]，表头"γ" → 改为"γ(kN/m³)"
+             * 列数据["25.3%", "26.1%", "24.8%"]，表头"含水率" → 改为"含水率(%)"
+
+        【执行流程】
+        - 步骤1：如果表头包含复合概念，先拆分列
+        - 步骤2：拆分后，检查是否需要跨行填充
+        - 步骤3：最后进行表头标准化（添加单位）
+
+        【输出格式】
+        {{
+            "has_optimization": true/false,
+            "optimization_type": ["split_headers", "cross_row_fill", "standardize_units"],
+            "optimized_table": [
+                ["优化后的表头1", "列2", "列3"],
+                ["数据1", "值2", "值3"]
+            ],
+            "explanation": "优化说明"
+        }}
+
+        【原始表格数据】
+        {table_str}
+
+        重要：
+        - 如果表格无需优化，optimized_table返回原始表格
+        - has_optimization为true时，optimized_table必须是优化后的完整表格
+        - 只返回JSON，不要有其他内容"""
 
         try:
             response = client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是一个岩土工程表格优化专家。只返回JSON格式结果，必须包含optimized_table字段。"},
+                    {"role": "system",
+                     "content": "你是一个岩土工程表格优化专家。只返回JSON格式结果，必须包含optimized_table字段。"},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=self.temperature,
@@ -763,6 +816,8 @@ class SecondaryLLMParser:
             )
 
             content = response.choices[0].message.content
+
+            # 提取JSON
             json_match = re.search(r'\{[\s\S]*\}', content)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -783,7 +838,7 @@ class SecondaryLLMParser:
         }
 
     def optimize_table(self, table_data: List[List[str]], table_name: str) -> Dict:
-        """优化表格"""
+        """优化表格 - 先硬编码去重，再调用LLM处理表头合并"""
         if not table_data or len(table_data) < 1:
             return {
                 "has_optimization": False,
@@ -791,8 +846,87 @@ class SecondaryLLMParser:
                 "explanation": "表格为空"
             }
 
-        print(f"  [二次解析] 调用DeepSeek优化{table_name}表格")
-        result = self._call_deepseek_for_optimization(table_data, table_name)
+        print(f"\n{'=' * 80}")
+        print(f"[二次解析] 开始处理: {table_name}")
+        print(f"{'=' * 80}")
+
+        # 显示原始表格信息
+        print(f"\n[原始表格信息]")
+        print(f"  行数: {len(table_data)}")
+        print(f"  列数: {max(len(row) for row in table_data) if table_data else 0}")
+
+        # 显示原始表格内容（前10行）
+        print(f"\n[原始表格内容] (显示前10行)")
+        print(f"-" * 80)
+        for i, row in enumerate(table_data[:10]):
+            row_str = " | ".join([str(cell)[:30] + "..." if len(str(cell)) > 30 else str(cell) for cell in row])
+            print(f"  行{i:3d}: {row_str}")
+        if len(table_data) > 10:
+            print(f"  ... (还有 {len(table_data) - 10} 行)")
+        print(f"-" * 80)
+
+        print(f"\n[硬编码去重处理]")
+        # 使用硬编码去重（保护表头）
+        dedup_result = TableDeduplicator.deduplicate_with_header_protection(table_data)
+        deduplicated_table = dedup_result["optimized_table"]
+
+        if dedup_result["has_optimization"]:
+            print(f"  ✓ 发现重复数据")
+            print(f"    删除重复行: {dedup_result['stats']['rows_removed']} 行")
+            print(f"    删除重复列: {dedup_result['stats']['cols_removed']} 列")
+            print(
+                f"    表格大小变化: {dedup_result['stats']['original_rows']}x{dedup_result['stats']['original_cols']} → {dedup_result['stats']['final_rows']}x{dedup_result['stats']['final_cols']}")
+        else:
+            print(f"  ✓ 未发现重复行或重复列")
+
+        # 显示去重后的表格内容
+        print(f"\n[去重后表格内容] (输入LLM前的表格)")
+        print(f"-" * 80)
+        for i, row in enumerate(deduplicated_table[:10]):
+            row_str = " | ".join([str(cell)[:30] + "..." if len(str(cell)) > 30 else str(cell) for cell in row])
+            print(f"  行{i:3d}: {row_str}")
+        if len(deduplicated_table) > 10:
+            print(f"  ... (还有 {len(deduplicated_table) - 10} 行)")
+        print(f"-" * 80)
+
+        # 显示将要发送给LLM的数据统计
+        print(f"\n[LLM输入数据统计]")
+        print(f"  行数: {len(deduplicated_table)}")
+        print(f"  列数: {max(len(row) for row in deduplicated_table) if deduplicated_table else 0}")
+        print(f"  总单元格数: {sum(len(row) for row in deduplicated_table)}")
+
+        print(f"\n[调用DeepSeek API] 优化表头合并...")
+        result = self._call_deepseek_for_optimization(deduplicated_table, table_name)
+
+        # 显示LLM优化结果
+        if result.get("has_optimization"):
+            print(f"  ✓ LLM优化完成")
+            print(f"    优化类型: {result.get('optimization_type', [])}")
+            print(f"    优化说明: {result.get('explanation', '')}")
+
+            # 显示优化后的表格预览
+            optimized_table = result.get("optimized_table", [])
+            print(f"\n[LLM优化后表格预览] (前5行)")
+            print(f"-" * 80)
+            for i, row in enumerate(optimized_table[:5]):
+                row_str = " | ".join([str(cell)[:30] + "..." if len(str(cell)) > 30 else str(cell) for cell in row])
+                print(f"  行{i:3d}: {row_str}")
+            if len(optimized_table) > 5:
+                print(f"  ... (还有 {len(optimized_table) - 5} 行)")
+            print(f"-" * 80)
+        else:
+            print(f"  ℹ LLM未发现需要优化的内容")
+
+        # 合并去重信息和LLM优化信息
+        if dedup_result["has_optimization"]:
+            result["deduplication_stats"] = dedup_result["stats"]
+            if not result.get("has_optimization", False):
+                result["has_optimization"] = True
+                result["optimization_type"].append("duplicate_rows_cols")
+
+        print(f"\n[二次解析完成] {table_name}")
+        print(f"{'=' * 80}\n")
+
         return result
 
 
@@ -1048,6 +1182,7 @@ def optimize_single_table(task_id, table_index):
 
         if main_table and len(main_table) > 0:
             print(f"\n[二次优化] 开始优化主表: {table_name}")
+            # 现在optimize_table内部会先做硬编码去重
             opt_result = parser_system.secondary_parser.optimize_table(main_table, f"{table_name}主表")
             optimized_main = opt_result.get("optimized_table", main_table)
 
@@ -1059,6 +1194,7 @@ def optimize_single_table(task_id, table_index):
                 "has_optimization": opt_result.get("has_optimization", False),
                 "optimization_type": opt_result.get("optimization_type", []),
                 "explanation": opt_result.get("explanation", ""),
+                "deduplication_stats": opt_result.get("deduplication_stats", None),  # 添加去重统计
                 "header_alignment": {
                     "stats": align_stats,
                     "changes": [d for d in align_stats.get('details', []) if d['original'] != d['aligned']]
@@ -1081,6 +1217,7 @@ def optimize_single_table(task_id, table_index):
                     "has_optimization": opt_result.get("has_optimization", False),
                     "optimization_type": opt_result.get("optimization_type", []),
                     "explanation": opt_result.get("explanation", ""),
+                    "deduplication_stats": opt_result.get("deduplication_stats", None),  # 添加去重统计
                     "header_alignment": {
                         "stats": sub_align_stats,
                         "changes": [d for d in sub_align_stats.get('details', []) if d['original'] != d['aligned']]
@@ -1116,6 +1253,11 @@ def optimize_all_tables(task_id):
         tables = task.result.get('tables', [])
         aligner = get_header_aligner()
         optimized_count = 0
+        total_dedup_stats = {
+            "total_rows_removed": 0,
+            "total_cols_removed": 0,
+            "tables_with_dedup": 0
+        }
 
         for table_idx, table in enumerate(tables):
             table_name = table.get('table_id', f'表格{table_idx}')
@@ -1134,34 +1276,54 @@ def optimize_all_tables(task_id):
 
             has_any_optimization = False
 
+            # 处理主表
             if main_table and len(main_table) > 0:
+                print(f"\n[批量优化] 开始优化{table_name}主表")
+                # optimize_table内部会先做硬编码去重
                 opt_result = parser_system.secondary_parser.optimize_table(main_table, f"{table_name}主表")
                 optimized_main = opt_result.get("optimized_table", main_table)
 
                 aligned_main, align_stats = aligner.align_table_headers(optimized_main)
                 aligned_main_with_units = aligner.align_and_merge_units(optimized_main)
 
+                # 统计去重信息
+                if opt_result.get("deduplication_stats"):
+                    total_dedup_stats["total_rows_removed"] += opt_result["deduplication_stats"]["rows_removed"]
+                    total_dedup_stats["total_cols_removed"] += opt_result["deduplication_stats"]["cols_removed"]
+                    total_dedup_stats["tables_with_dedup"] += 1
+
                 optimization_result["main_table_optimized"] = {
                     "optimized": aligned_main_with_units,
                     "has_optimization": opt_result.get("has_optimization", False),
                     "optimization_type": opt_result.get("optimization_type", []),
                     "explanation": opt_result.get("explanation", ""),
+                    "deduplication_stats": opt_result.get("deduplication_stats", None),
                     "header_alignment": {
                         "stats": align_stats,
                         "changes": [d for d in align_stats.get('details', []) if d['original'] != d['aligned']]
                     }
                 }
+
                 if opt_result.get("has_optimization"):
                     has_any_optimization = True
 
+            # 处理所有附表
             for sub_idx, sub_tab in enumerate(sub_tables):
                 sub_data = sub_tab.get('data', [])
                 if sub_data and len(sub_data) > 0:
-                    opt_result = parser_system.secondary_parser.optimize_table(sub_data, f"{table_name}附表{sub_idx + 1}")
+                    print(f"\n[批量优化] 开始优化{table_name}附表{sub_idx + 1}")
+                    opt_result = parser_system.secondary_parser.optimize_table(sub_data,
+                                                                               f"{table_name}附表{sub_idx + 1}")
                     optimized_sub = opt_result.get("optimized_table", sub_data)
 
                     aligned_sub, sub_align_stats = aligner.align_table_headers(optimized_sub)
                     aligned_sub_with_units = aligner.align_and_merge_units(optimized_sub)
+
+                    # 统计去重信息
+                    if opt_result.get("deduplication_stats"):
+                        total_dedup_stats["total_rows_removed"] += opt_result["deduplication_stats"]["rows_removed"]
+                        total_dedup_stats["total_cols_removed"] += opt_result["deduplication_stats"]["cols_removed"]
+                        total_dedup_stats["tables_with_dedup"] += 1
 
                     optimization_result["sub_tables_optimized"].append({
                         "sub_table_index": sub_idx,
@@ -1169,11 +1331,13 @@ def optimize_all_tables(task_id):
                         "has_optimization": opt_result.get("has_optimization", False),
                         "optimization_type": opt_result.get("optimization_type", []),
                         "explanation": opt_result.get("explanation", ""),
+                        "deduplication_stats": opt_result.get("deduplication_stats", None),
                         "header_alignment": {
                             "stats": sub_align_stats,
                             "changes": [d for d in sub_align_stats.get('details', []) if d['original'] != d['aligned']]
                         }
                     })
+
                     if opt_result.get("has_optimization"):
                         has_any_optimization = True
 
@@ -1182,9 +1346,16 @@ def optimize_all_tables(task_id):
 
             tables[table_idx]["secondary_optimized"] = optimization_result
 
+        # 返回优化结果统计
         return jsonify({
             "success": True,
-            "optimized_count": optimized_count
+            "optimized_count": optimized_count,
+            "total_tables": len(tables),
+            "deduplication_summary": {
+                "total_rows_removed": total_dedup_stats["total_rows_removed"],
+                "total_cols_removed": total_dedup_stats["total_cols_removed"],
+                "tables_with_deduplication": total_dedup_stats["tables_with_dedup"]
+            }
         })
 
     except Exception as e:
