@@ -442,6 +442,99 @@ class LLMTableParser:
             "sub_tables": []
         }
 
+
+    def _adapt_cached_result(self, cached_result, table_data):
+        """自适应修正缓存结果中的行列索引，使其适配当前表格的实际尺寸。"""
+        import copy
+        adapted = copy.deepcopy(cached_result)
+        total_rows = len(table_data)
+        total_cols = max(len(r) for r in table_data) if table_data else 0
+        changes = []
+
+        def _clamp(value, lo, hi):
+            return max(lo, min(value, hi))
+
+        # 1. 主表：clamp + 自适应扩展
+        if adapted.get("has_main_table") and adapted.get("main_table"):
+            mt = adapted["main_table"]
+            old_sr, old_er = mt["start_row"], mt["end_row"]
+            old_sc, old_ec = mt["start_col"], mt["end_col"]
+
+            mt["start_row"] = _clamp(mt["start_row"], 0, total_rows - 1)
+            mt["start_col"] = _clamp(mt["start_col"], 0, total_cols - 1)
+            mt["end_col"]   = _clamp(mt["end_col"], mt["start_col"], total_cols - 1)
+
+            if adapted.get("has_sub_tables") and adapted["sub_tables"]:
+                first_sub_start = min(st["start_row"] for st in adapted["sub_tables"])
+                mt["end_row"] = _clamp(max(mt["end_row"], first_sub_start - 1), mt["start_row"], total_rows - 1)
+            else:
+                mt["end_row"] = total_rows - 1
+
+            if old_sr != mt["start_row"] or old_er != mt["end_row"]:
+                changes.append("main row {}->{} -> {}->{}".format(old_sr, old_er, mt['start_row'], mt['end_row']))
+            if old_sc != mt["start_col"] or old_ec != mt["end_col"]:
+                changes.append("main col {}->{} -> {}->{}".format(old_sc, old_ec, mt['start_col'], mt['end_col']))
+
+        # 2. 附表：clamp + 排除与主表重叠的
+        if adapted.get("has_sub_tables"):
+            valid = []
+            mt = adapted.get("main_table") if adapted.get("has_main_table") else None
+            for st in adapted["sub_tables"]:
+                st["start_row"] = _clamp(st["start_row"], 0, total_rows - 1)
+                st["end_row"]   = _clamp(st["end_row"], st["start_row"], total_rows - 1)
+                st["start_col"] = _clamp(st["start_col"], 0, total_cols - 1)
+                st["end_col"]   = _clamp(st["end_col"], st["start_col"], total_cols - 1)
+
+                if mt:
+                    if st["start_row"] >= mt["start_row"] and st["end_row"] <= mt["end_row"]:
+                        changes.append("sub-table row {}-{} overlaps main, removed".format(st['start_row'], st['end_row']))
+                        continue
+                if st["end_row"] >= st["start_row"] and st["end_col"] >= st["start_col"]:
+                    valid.append(st)
+            adapted["sub_tables"] = valid
+            adapted["has_sub_tables"] = len(valid) > 0
+
+        # 3. 备注：clamp + 排除与主表重叠的
+        if adapted.get("has_remarks"):
+            valid = []
+            mt = adapted.get("main_table") if adapted.get("has_main_table") else None
+            for r in adapted["remarks"]:
+                r["start_row"] = _clamp(r["start_row"], 0, total_rows - 1)
+                r["end_row"]   = _clamp(r["end_row"], r["start_row"], total_rows - 1)
+                r["start_col"] = _clamp(r["start_col"], 0, total_cols - 1)
+                r["end_col"]   = _clamp(r["end_col"], r["start_col"], total_cols - 1)
+
+                if mt:
+                    if r["start_row"] >= mt["start_row"] and r["end_row"] <= mt["end_row"]:
+                        changes.append("remark row {}-{} overlaps main, removed".format(r['start_row'], r['end_row']))
+                        continue
+                if r["end_row"] >= r["start_row"] and r["end_col"] >= r["start_col"]:
+                    valid.append(r)
+            adapted["remarks"] = valid
+            adapted["has_remarks"] = len(valid) > 0
+
+        # 4. Headers 中的 col_index 也做 clamp
+        for section in ["main_table", "sub_tables"]:
+            items = []
+            if section == "main_table" and adapted.get("main_table"):
+                items = [adapted["main_table"]]
+            elif section == "sub_tables":
+                items = adapted.get("sub_tables", [])
+            for item in items:
+                for h in item.get("headers", []):
+                    h["col_index"] = _clamp(h.get("col_index", 0), 0, total_cols - 1)
+                    h["start_col"] = _clamp(h.get("start_col", 0), 0, total_cols - 1)
+                    h["end_col"]   = _clamp(h.get("end_col", 0), 0, total_cols - 1)
+
+        if changes:
+            print("  [cache adapt] table {}x{}, {} change(s):".format(total_rows, total_cols, len(changes)))
+            for c in changes:
+                print("    - {}".format(c))
+        else:
+            print("  [cache adapt] table {}x{}, no changes needed".format(total_rows, total_cols))
+
+        return adapted
+
     def parse(self, table_data: List[List[str]]) -> Dict:
         """解析表格，返回主表/备注/附表的位置信息"""
         if not table_data:
@@ -460,7 +553,7 @@ class LLMTableParser:
         # 检查缓存
         if self.cache is not None and signature in self.cache:
             print(f"  [缓存命中] 使用相同结构表格的解析结果")
-            return self.cache[signature]
+            return self._adapt_cached_result(self.cache[signature], table_data)
 
         # 调用大模型
         print(f"  [调用DeepSeek] 解析表格 {len(table_data)}行 x {len(table_data[0]) if table_data else 0}列")
