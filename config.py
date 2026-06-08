@@ -7,7 +7,7 @@ import os
 # Flask配置
 FLASK_CONFIG = {
     'UPLOAD_FOLDER': './uploads',
-    'MAX_CONTENT_LENGTH': 50 * 1024 * 1024,  # 50MB
+    'MAX_CONTENT_LENGTH': 200 * 1024 * 1024,  # 200MB
     'SECRET_KEY': 'geotechnical-parser-secret-key',
     'DEBUG': True,
     'HOST': '0.0.0.0',
