@@ -729,6 +729,10 @@ class LLMTableParser:
             self.cache[signature] = result
             if table_data and len(table_data) > 0:
                 result["_raw_header"] = table_data[0]
+                for st in result.get("sub_tables", []):
+                    sr = st.get("start_row", -1)
+                    if 0 <= sr < len(table_data):
+                        st["_raw_header"] = table_data[sr]
 
         return result
 
@@ -1283,6 +1287,17 @@ class GeotechnicalParserSystem:
                             "data": sub_content
                         })
 
+                # === Tower leg sub-table merge (separate result, does NOT modify originals) ===
+                tower_leg_merged = None
+                for st in sub_table_data:
+                    if self._has_tower_leg_header(st):
+                        merged_main, merge_info = self._merge_tower_leg_subtable(main_table_data, st)
+                        if merged_main is not None:
+                            tower_leg_merged = merge_info
+                            tower_leg_merged["sub_table_index"] = sub_table_data.index(st)
+                            print(f"         [tower_leg] merged sub-table: {merge_info['tower_leg_count']} legs")
+                            break
+
                 parsed_tables.append({
                     "table_id": f"T_{idx + 1:04d}_{sub_idx + 1}",
                     "original_data": cleaned_table,
@@ -1290,6 +1305,7 @@ class GeotechnicalParserSystem:
                     "main_table": main_table_data,
                     "remarks": remark_data,
                     "sub_tables": sub_table_data,
+                    "tower_leg_merged": tower_leg_merged,
                     "secondary_optimized": None,
                     "metadata": {
                         "rows": len(merged_table),
@@ -1451,6 +1467,175 @@ class GeotechnicalParserSystem:
 
         return table_data
 
+
+    @staticmethod
+    def _has_tower_leg_header(sub_table):
+        """Check if sub-table has tower leg header."""
+        data = sub_table.get("data", [])
+        if not data or len(data) < 1:
+            return False
+        headers = data[0]
+        for h in headers:
+            if h and "塔腿" in str(h):
+                return True
+        return False
+
+    @staticmethod
+    def _merge_tower_leg_subtable(main_table, sub_table):
+        """Merge tower leg sub-table into main table.
+        Handles multiple data rows in sub-table - each row's tower legs are expanded.
+        Adds sub-table's unique columns to main table.
+        Does NOT modify the original main_table.
+        Returns (merged_main_table, merge_info) or (None, None) if no matches.
+        """
+        import copy, re as _re
+        main_table = copy.deepcopy(main_table)
+        sub_data = sub_table.get("data", [])
+        if not sub_data or len(sub_data) < 2:
+            return None, None
+
+        sub_headers = sub_data[0]
+        sub_rows = sub_data[1:]  # all data rows
+
+        # Find tower leg column index
+        tower_leg_idx = None
+        for i, h in enumerate(sub_headers):
+            if h and "塔腿" in str(h):
+                tower_leg_idx = i
+                break
+        if tower_leg_idx is None:
+            return None, None
+
+        if not main_table or len(main_table) < 2:
+            return None, None
+
+        # Add missing columns from sub_table to main_table header
+        main_headers = main_table[0]
+        new_col_map = {}  # {col_name: col_index_in_main}
+        for i, h in enumerate(sub_headers):
+            h_str = str(h) if h else ""
+            if i == tower_leg_idx:
+                continue
+            if not h_str:
+                continue
+            # Check if this header already exists in main table
+            already_exists = any(h_str == str(mh) for mh in main_headers)
+            if not already_exists:
+                main_headers.append(h_str)
+                new_col_map[i] = len(main_headers) - 1
+                for r in main_table[1:]:
+                    r.append("")
+
+        # Add tower_leg column if not present
+        tower_leg_header = "塔腿"
+        if tower_leg_header not in main_headers:
+            main_headers.append(tower_leg_header)
+            for r in main_table[1:]:
+                r.append("")
+        tower_leg_col = main_headers.index(tower_leg_header)
+
+        # Pad all rows to same width
+        cols = len(main_headers)
+        for r in main_table:
+            while len(r) < cols:
+                r.append("")
+
+        all_tower_legs = []
+        total_copies = 0
+        used_rows = set()  # Track matched main table rows (greedy)
+
+        # Build a list of (match_atoms, tower_legs, sub_row_values) for each sub-row
+        sub_matches = []
+        for data_row in sub_rows:
+            tower_leg_raw = str(data_row[tower_leg_idx]).strip() if tower_leg_idx < len(data_row) else ""
+            if not tower_leg_raw:
+                continue
+            tower_legs = tower_leg_raw.split()
+            if len(tower_legs) < 2:
+                continue
+
+            # Build match conditions from lithology columns
+            match_values = set()
+            for i, h in enumerate(sub_headers):
+                if i == tower_leg_idx:
+                    continue
+                if "岩" not in str(h):
+                    continue
+                val = str(data_row[i]).strip() if i < len(data_row) else ""
+                if val:
+                    match_values.add(val)
+
+            if not match_values:
+                continue
+
+            # Split into atoms
+            all_atoms = set()
+            for mv in match_values:
+                parts = _re.split(r'[（）()]', mv)
+                atoms = set(p.strip() for p in parts if p.strip())
+                if not atoms:
+                    atoms.add(mv)
+                all_atoms.update(atoms)
+
+            # Greedy top-down matching: first unmatched row wins
+            matched_idx = None
+            for row_idx in range(1, len(main_table)):
+                if row_idx in used_rows:
+                    continue
+                row_text = " ".join(str(c) for c in main_table[row_idx])
+                if all(atom in row_text for atom in all_atoms):
+                    matched_idx = row_idx
+                    break
+
+            if matched_idx is None:
+                print("         [tower_leg] atoms=" + str(all_atoms) + " no unmatched row found, skipping")
+                continue
+
+            used_rows.add(matched_idx)
+            sub_matches.append({
+                "match_idx": matched_idx,
+                "tower_legs": tower_legs,
+                "atoms": all_atoms,
+                "data_row": data_row
+            })
+            all_tower_legs.extend(tower_legs)
+
+        if not sub_matches:
+            return None, None
+
+        print("         [tower_leg] " + str(len(sub_matches)) + " sub-rows matched, total " + str(sum(len(m["tower_legs"]) for m in sub_matches)) + " tower leg copies")
+
+        # Build new main table
+        new_main = [main_headers[:]]
+        for row_idx in range(1, len(main_table)):
+            # Check if this row is matched by any sub-row
+            matched_subs = [m for m in sub_matches if m["match_idx"] == row_idx]
+            if matched_subs:
+                for m in matched_subs:
+                    base_row = main_table[row_idx][:]
+                    for leg in m["tower_legs"]:
+                        new_row = base_row[:]
+                        new_row[tower_leg_col] = leg
+                        # Fill new columns from sub-table
+                        for src_col, dst_col in new_col_map.items():
+                            if src_col < len(m["data_row"]):
+                                new_row[dst_col] = str(m["data_row"][src_col])
+                        new_main.append(new_row)
+                        total_copies += 1
+            else:
+                new_main.append(main_table[row_idx][:])
+
+        merge_info = {
+            "merged": True,
+            "tower_leg_count": total_copies,
+            "tower_legs": all_tower_legs,
+            "match_atoms": list(set(a for m in sub_matches for a in m["atoms"])),
+            "matched_rows": len(set(m["match_idx"] for m in sub_matches)),
+            "sub_rows_used": len(sub_matches),
+            "merged_main_table": new_main
+        }
+
+        return new_main, merge_info
 
 # ============================================================================
 # Flask API

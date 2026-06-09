@@ -231,10 +231,12 @@
                 <button class="tab-btn active" data-tab="parsed">📊 第一次解析结果</button>
                 <button class="tab-btn" data-tab="secondary">✨ 二次优化结果</button>
                 <button class="tab-btn" data-tab="original">📋 原始表格</button>
+                <button class="tab-btn" data-tab="towerLeg">塔腿合并</button>
             </div>
             <div id="parsedContent"></div>
             <div id="secondaryContent" style="display: none;"></div>
             <div id="originalContent" style="display: none;"></div>
+            <div id="towerLegContent" style="display: none;"></div>
         </div>
     </div>
 
@@ -430,6 +432,7 @@
             displayParsedTables(tables);
             displaySecondaryOptimization(tables);
             displayOriginalTables(tables);
+            displayTowerLegMerged(tables);
         }
 
         // 第一次解析结果 - 完全保持原样显示，添加优化按钮
@@ -649,6 +652,59 @@
             }).join('');
         }
 
+        function displayTowerLegMerged(tables) {
+            const container = document.getElementById('towerLegContent');
+            if (!tables || tables.length === 0) {
+                container.innerHTML = '<div class="table-card"><p>暂无塔腿合并结果</p></div>';
+                return;
+            }
+            let hasAny = false;
+            let html = '';
+            tables.forEach((table, idx) => {
+                const tlm = table.tower_leg_merged;
+                if (!tlm || !tlm.merged) return;
+                hasAny = true;
+                const tableId = table.table_id || 'T_' + (idx + 1);
+                const mergedTable = tlm.merged_main_table || [];
+                const towerLegs = tlm.tower_legs || [];
+                const matchAtoms = tlm.match_atoms || [];
+
+                html += '<div class="table-card">';
+                html += '<div class="table-title">';
+                html += '<span>&#x1f3d7; ' + escapeHtml(tableId) + ' - 塔腿合并结果</span>';
+                html += '<span class="badge badge-main">塔腿: ' + towerLegs.join(' / ') + '</span>';
+                html += '</div>';
+                html += '<div style="padding:8px 16px;color:#666;font-size:13px;">';
+                html += '匹配原子词: <b>' + matchAtoms.join(', ') + '</b>';
+                html += ' | 命中1行，扩展为<b>' + towerLegs.length + '</b>行';
+                html += '</div>';
+                if (mergedTable.length > 0) {
+                    html += '<div style="overflow-x:auto;padding:0 16px 16px;">';
+                    html += '<table class="data-table"><thead><tr>';
+                    mergedTable[0].forEach((cell, colIdx) => {
+                        const isTL = cell === '塔腿';
+                        html += '<th' + (isTL ? ' style="background:#fff3cd;"' : '') + '>' + (escapeHtml(cell) || '列' + colIdx) + '</th>';
+                    });
+                    html += '</tr></thead><tbody>';
+                    mergedTable.slice(1).forEach(row => {
+                        html += '<tr>';
+                        row.forEach((cell, colIdx) => {
+                            const isTL = mergedTable[0][colIdx] === '塔腿';
+                            html += '<td' + (isTL ? ' style="background:#fffde7;font-weight:bold;"' : '') + '>' + escapeHtml(cell || '') + '</td>';
+                        });
+                        html += '</tr>';
+                    });
+                    html += '</tbody></table></div>';
+                }
+                html += '</div>';
+            });
+            if (!hasAny) {
+                container.innerHTML = '<div class="table-card"><p>暂无塔腿合并结果（未检测到塔腿附表）</p></div>';
+            } else {
+                container.innerHTML = html;
+            }
+        }
+
         function displayOriginalTables(tables) {
             const container = document.getElementById('originalContent');
             if (!tables || tables.length === 0) {
@@ -720,6 +776,7 @@
                 document.getElementById('parsedContent').style.display = tab === 'parsed' ? 'block' : 'none';
                 document.getElementById('secondaryContent').style.display = tab === 'secondary' ? 'block' : 'none';
                 document.getElementById('originalContent').style.display = tab === 'original' ? 'block' : 'none';
+                document.getElementById('towerLegContent').style.display = tab === 'towerLeg' ? 'block' : 'none';
             };
         });
 
