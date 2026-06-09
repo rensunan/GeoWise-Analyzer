@@ -1241,8 +1241,10 @@ class GeotechnicalParserSystem:
                 merged_rows = self.table_processor.merge_adjacent_rows(sub_table)
                 merged_table = self.table_processor.merge_adjacent_cols(merged_rows)
 
-                parse_result = self.llm_parser.parse(merged_table)
-                parse_result = self.table_extractor.fix_remark_boundary(merged_table, parse_result)
+                cleaned_table, groundwater_remarks = self._extract_groundwater_rows(merged_table)
+
+                parse_result = self.llm_parser.parse(cleaned_table)
+                parse_result = self.table_extractor.fix_remark_boundary(cleaned_table, parse_result)
 
                 main_table_data = []
                 remark_data = []
@@ -1250,12 +1252,18 @@ class GeotechnicalParserSystem:
 
                 if parse_result.get("has_main_table"):
                     main_table_data = self.table_extractor.extract_sub_table(
-                        merged_table, parse_result["main_table"]
+                        cleaned_table, parse_result["main_table"]
                     )
+                    llm_headers = parse_result.get("main_table", {}).get("headers", [])
+                    header_names = [h.get("header_name", "") for h in llm_headers]
+                    main_table_data = self._fill_consistent_columns(main_table_data, header_names)
+
+                if groundwater_remarks:
+                    remark_data.extend(groundwater_remarks)
 
                 if parse_result.get("has_remarks"):
                     for remark in parse_result.get("remarks", []):
-                        remark_content = self.table_extractor.extract_sub_table(merged_table, remark)
+                        remark_content = self.table_extractor.extract_sub_table(cleaned_table, remark)
                         deduplicated_content = self.table_extractor._deduplicate_remark_content(remark_content)
                         remark_data.append({
                             "region": remark,
@@ -1266,7 +1274,10 @@ class GeotechnicalParserSystem:
 
                 if parse_result.get("has_sub_tables"):
                     for sub_tab in parse_result.get("sub_tables", []):
-                        sub_content = self.table_extractor.extract_sub_table(merged_table, sub_tab)
+                        sub_content = self.table_extractor.extract_sub_table(cleaned_table, sub_tab)
+                        st_headers = sub_tab.get("headers", [])
+                        st_header_names = [h.get("header_name", "") for h in st_headers]
+                        sub_content = self._fill_consistent_columns(sub_content, st_header_names)
                         sub_table_data.append({
                             "region": sub_tab,
                             "data": sub_content
@@ -1274,7 +1285,7 @@ class GeotechnicalParserSystem:
 
                 parsed_tables.append({
                     "table_id": f"T_{idx + 1:04d}_{sub_idx + 1}",
-                    "original_data": merged_table,
+                    "original_data": cleaned_table,
                     "parse_result": parse_result,
                     "main_table": main_table_data,
                     "remarks": remark_data,
@@ -1295,6 +1306,150 @@ class GeotechnicalParserSystem:
             "text_count": len(text_paragraphs),
             "tables": parsed_tables
         }
+
+
+    def _extract_groundwater_rows(self, table_data):
+        import copy
+        groundwater_keywords = TABLE_PROCESSOR_CONFIG["groundwater_keywords"]
+        max_zone_cells = 4
+
+        if not table_data or len(table_data) < 2:
+            return table_data, []
+
+        cleaned = copy.deepcopy(table_data)
+
+        header_row = cleaned[0] if cleaned else []
+        for cell in header_row:
+            if self._matches_groundwater(cell, groundwater_keywords):
+                print("  [groundwater] header has keyword: " + cell + ", skip")
+                return cleaned, []
+
+        groundwater_remarks = []
+
+        for row_idx in range(1, len(cleaned)):
+            row = cleaned[row_idx]
+            col_cursor = 0
+            while col_cursor < len(row):
+                cell = row[col_cursor].strip() if row[col_cursor] else ""
+                if not cell:
+                    col_cursor += 1
+                    continue
+
+                if self._matches_groundwater(cell, groundwater_keywords):
+                    label_text = cell
+                    zone_start = col_cursor
+                    zone_end = col_cursor
+                    value_parts = []
+                    cells_in_zone = 1
+
+                    next_col = col_cursor + 1
+                    while next_col < len(row) and cells_in_zone < max_zone_cells:
+                        next_cell = row[next_col].strip() if row[next_col] else ""
+                        if next_cell == label_text:
+                            zone_end = next_col
+                            cells_in_zone += 1
+                            next_col += 1
+                        else:
+                            break
+
+                    if next_col < len(row) and cells_in_zone < max_zone_cells:
+                        next_cell = row[next_col].strip() if row[next_col] else ""
+                        if next_cell and not self._matches_groundwater(next_cell, groundwater_keywords):
+                            value_parts.append(next_cell)
+                            zone_end = next_col
+
+                    if value_parts:
+                        remark_text = label_text + "：" + " ".join(value_parts)
+                    else:
+                        remark_text = label_text
+                    groundwater_remarks.append({
+                        "region": {
+                            "start_row": row_idx, "end_row": row_idx,
+                            "start_col": zone_start, "end_col": zone_end,
+                            "content": remark_text
+                        },
+                        "data": [[remark_text]]
+                    })
+
+                    print("  [groundwater] extracted row" + str(row_idx) + " col" + str(zone_start) + "-" + str(zone_end) + ": " + remark_text)
+
+                    for cc in range(zone_start, zone_end + 1):
+                        if cc < len(cleaned[row_idx]):
+                            cleaned[row_idx][cc] = ""
+
+                    col_cursor = zone_end + 1
+                else:
+                    col_cursor += 1
+
+        if groundwater_remarks:
+            print("  [groundwater] total " + str(len(groundwater_remarks)) + " remarks extracted")
+        else:
+            print("  [groundwater] none found")
+
+        return cleaned, groundwater_remarks
+
+    @staticmethod
+    def _matches_groundwater(cell_text, keywords):
+        if not cell_text:
+            return False
+        cell_clean = cell_text.strip()
+        cell_clean = cell_clean.replace(chr(10), "").replace(chr(13), "")
+        for kw in keywords:
+            if cell_clean.startswith(kw):
+                return True
+        return False
+
+    @staticmethod
+    def _fill_consistent_columns(table_data, header_names=None):
+        if not table_data or len(table_data) < 2:
+            return table_data
+
+        rows = len(table_data)
+        cols = max(len(row) for row in table_data)
+
+        for row in table_data:
+            while len(row) < cols:
+                row.append("")
+
+        data_start = 1
+        if header_names and len(header_names) > 0:
+            header_names_set = set(h.strip() for h in header_names if h and h.strip())
+            last_header_row = -1
+            for r in range(rows):
+                row_cells = [c.strip() for c in table_data[r] if c and c.strip()]
+                if not row_cells:
+                    continue
+                matches = sum(1 for c in row_cells if c in header_names_set)
+                if matches > 0:
+                    last_header_row = r
+            if last_header_row >= 0:
+                data_start = last_header_row + 1
+
+        if data_start >= rows:
+            return table_data
+
+        print("  [fill] data starts at row " + str(data_start) + " (total " + str(rows) + " rows)")
+
+        for col in range(cols):
+            values = set()
+            for row_idx in range(data_start, rows):
+                cell = table_data[row_idx][col].strip() if col < len(table_data[row_idx]) else ""
+                if cell:
+                    values.add(cell)
+
+            if len(values) == 1:
+                fill_value = values.pop()
+                filled_count = 0
+                for row_idx in range(data_start, rows):
+                    if col < len(table_data[row_idx]):
+                        cell = table_data[row_idx][col].strip()
+                        if not cell:
+                            table_data[row_idx][col] = fill_value
+                            filled_count += 1
+                if filled_count > 0:
+                    print("  [fill] col " + str(col) + ": filled " + str(filled_count) + " cells with '" + fill_value + "'")
+
+        return table_data
 
 
 # ============================================================================

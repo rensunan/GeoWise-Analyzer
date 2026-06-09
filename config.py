@@ -34,6 +34,10 @@ DOC_PARSER_CONFIG = {
 TABLE_PROCESSOR_CONFIG = {
     'header_similarity_threshold': 2/3,  # 表头相似度阈值
     'remark_keywords': ['建议', '说明', '注', '备注'],
+    'groundwater_keywords': [
+        '地下水', '地下水位', '地下水埋深', '地下水变幅',
+        '初见水位', '稳定水位', '水位埋深', '水位变幅'
+    ],
     'remark_max_length': 50,              # 备注最大长度阈值
     'remark_min_length_for_merge': 50,    # 合并备注的最小长度
     'remark_similarity_threshold': 0.6    # 备注相似度阈值
