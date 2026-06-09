@@ -443,6 +443,162 @@ class LLMTableParser:
         }
 
 
+
+    @staticmethod
+    def _get_column_types(table_data, start_row, end_row, start_col, end_col):
+        col_types = []
+        for j in range(start_col, end_col + 1):
+            numeric_count = 0
+            text_count = 0
+            total = 0
+            for i in range(start_row + 1, end_row + 1):
+                if i < len(table_data) and j < len(table_data[i]):
+                    cell = str(table_data[i][j]).strip()
+                    if cell:
+                        total += 1
+                        try:
+                            float(cell.replace(",", "").replace(chr(0xff0c), ""))
+                            numeric_count += 1
+                        except ValueError:
+                            text_count += 1
+            if total == 0:
+                col_types.append("empty")
+            elif numeric_count / total >= 0.8:
+                col_types.append("numeric")
+            elif text_count / total >= 0.8:
+                col_types.append("text")
+            else:
+                col_types.append("mixed")
+        return col_types
+
+    @staticmethod
+    def _row_matches_types(row, col_types, start_col):
+        for j, col_type in enumerate(col_types):
+            if col_type in ("mixed", "empty"):
+                continue
+            actual_col = start_col + j
+            if actual_col >= len(row):
+                continue
+            cell = str(row[actual_col]).strip()
+            if not cell:
+                continue
+            if col_type == "numeric":
+                try:
+                    float(cell.replace(",", "").replace(chr(0xff0c), ""))
+                except ValueError:
+                    return False
+            elif col_type == "text":
+                try:
+                    float(cell.replace(",", "").replace(chr(0xff0c), ""))
+                    return False
+                except ValueError:
+                    pass
+        return True
+
+    def _trim_by_consistency(self, table_data, adapted):
+        if not adapted.get("has_main_table") or not adapted.get("main_table"):
+            return adapted
+        mt = adapted["main_table"]
+        if mt["end_row"] <= mt["start_row"]:
+            return adapted
+        col_types = self._get_column_types(
+            table_data, mt["start_row"], mt["end_row"],
+            mt["start_col"], mt["end_col"]
+        )
+        if all(ct in ("mixed", "empty") for ct in col_types):
+            return adapted
+        for i in range(mt["start_row"] + 1, mt["end_row"] + 1):
+            row = table_data[i]
+            if not self._row_matches_types(row, col_types, mt["start_col"]):
+                mt["end_row"] = i - 1
+                print("  [consistency] main stopped at row %d, type mismatch at row %d"
+                      % (mt["end_row"], i))
+                break
+        return adapted
+
+
+
+
+
+    def _realign_headers(self, cached_result, table_data):
+        import copy, re as _re
+        if not table_data:
+            return None
+        total_rows = len(table_data)
+        adapted = copy.deepcopy(cached_result)
+
+        def _norm(cell):
+            if not cell:
+                return ''
+            return _re.sub(r'\s+', '', str(cell))
+
+        def _sim(raw, row):
+            nh = [_norm(c) for c in raw if _norm(c)]
+            nr = [_norm(c) for c in row if _norm(c)]
+            if not nh or not nr:
+                return 0.0
+            m = 0
+            for hc in nh:
+                for rc in nr:
+                    if hc in rc or rc in hc:
+                        m += 1
+                        break
+            return m / len(nh)
+
+        # 1. main header
+        raw_h = cached_result.get('_raw_header', [])
+        if not raw_h and adapted.get('main_table'):
+            raw_h = [h.get('header_name','') for h in adapted['main_table'].get('headers',[])]
+        if not raw_h:
+            print('  [header realign] no header data, giving up')
+            return None
+
+        best_r, best_s = -1, 0.0
+        for r in range(total_rows):
+            s = _sim(raw_h, table_data[r])
+            if s > best_s:
+                best_s, best_r = s, r
+
+        if best_s < 0.5:
+            print('  [header realign] best row %d score %.2f < 0.5, giving up' % (best_r, best_s))
+            print('  [header realign] cached: %s' % [_norm(c) for c in raw_h[:8]])
+            print('  [header realign] row 0:  %s' % [_norm(c) for c in table_data[0][:10]])
+            return None
+
+        mt = adapted.get('main_table')
+        if mt and best_r != mt.get('start_row', 0):
+            shift = best_r - mt['start_row']
+            print('  [header realign] main row %d -> %d (score %.2f)' % (mt['start_row'], best_r, best_s))
+            mt['start_row'] = best_r
+            mt['end_row'] = min(total_rows - 1, mt['end_row'] + shift)
+
+        # 2. sub headers
+        if adapted.get('has_sub_tables'):
+            for st in adapted.get('sub_tables', []):
+                sraw = st.get('_raw_header', [])
+                if not sraw:
+                    sraw = [h.get('header_name','') for h in st.get('headers',[])]
+                if not sraw:
+                    continue
+                br, bs = -1, 0.0
+                for r in range(total_rows):
+                    if r == best_r:
+                        continue
+                    s = _sim(sraw, table_data[r])
+                    if s > bs:
+                        bs, br = s, r
+                if bs < 0.5:
+                    print('  [header realign] sub not found (best %.2f), giving up' % bs)
+                    return None
+                if br != st.get('start_row', 0):
+                    print('  [header realign] sub row %d -> %d (score %.2f)' % (st['start_row'], br, bs))
+                    shift = br - st['start_row']
+                    st['start_row'] = br
+                    st['end_row'] = min(total_rows - 1, st['end_row'] + shift)
+
+        return adapted
+
+
     def _adapt_cached_result(self, cached_result, table_data):
         """自适应修正缓存结果中的行列索引，使其适配当前表格的实际尺寸。"""
         import copy
@@ -533,6 +689,7 @@ class LLMTableParser:
         else:
             print("  [cache adapt] table {}x{}, no changes needed".format(total_rows, total_cols))
 
+        adapted = self._trim_by_consistency(table_data, adapted)
         return adapted
 
     def parse(self, table_data: List[List[str]]) -> Dict:
@@ -552,8 +709,13 @@ class LLMTableParser:
 
         # 检查缓存
         if self.cache is not None and signature in self.cache:
-            print(f"  [缓存命中] 使用相同结构表格的解析结果")
-            return self._adapt_cached_result(self.cache[signature], table_data)
+            cached = self.cache[signature]
+            realigned = self._realign_headers(cached, table_data)
+            if realigned is not None:
+                print(f"  [缓存命中] 使用相同结构表格的解析结果")
+                return self._adapt_cached_result(realigned, table_data)
+            else:
+                print(f"  [缓存命中但表头检索失败] 重新调用大模型")
 
         # 调用大模型
         print(f"  [调用DeepSeek] 解析表格 {len(table_data)}行 x {len(table_data[0]) if table_data else 0}列")
@@ -565,6 +727,8 @@ class LLMTableParser:
                 oldest_key = next(iter(self.cache))
                 del self.cache[oldest_key]
             self.cache[signature] = result
+            if table_data and len(table_data) > 0:
+                result["_raw_header"] = table_data[0]
 
         return result
 
