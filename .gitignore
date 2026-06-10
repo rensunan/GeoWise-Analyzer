@@ -1,0 +1,28 @@
+﻿# 敏感文件 - 包含密钥和密码
+.env
+config.local.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 运行时目录
+uploads/
+results/
+logs/
+
+# 操作系统
+.DS_Store
+Thumbs.db

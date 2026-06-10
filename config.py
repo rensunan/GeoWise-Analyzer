@@ -1,28 +1,52 @@
-"""
+﻿"""
 配置文件 - 岩土报告智能解析系统
 """
 
 import os
 
+# ---------- 从 .env 文件加载环境变量 ----------
+def _load_dotenv():
+    '''简陋的 .env 加载器，避免引入额外依赖'''
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+_load_dotenv()
+
 # Flask配置
 FLASK_CONFIG = {
     'UPLOAD_FOLDER': './uploads',
     'MAX_CONTENT_LENGTH': 200 * 1024 * 1024,  # 200MB
-    'SECRET_KEY': 'geotechnical-parser-secret-key',
-    'DEBUG': True,
-    'HOST': '0.0.0.0',
-    'PORT': 5000
+    'SECRET_KEY': os.environ.get('SECRET_KEY', 'geotechnical-parser-secret-key'),
+    'DEBUG': os.environ.get('DEBUG', 'True').lower() == 'true',
+    'HOST': os.environ.get('HOST', '0.0.0.0'),
+    'PORT': int(os.environ.get('PORT', 5000))
 }
 
 # DeepSeek API配置
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-db068eaf4d794e33a0d452203e4d8e9a")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+if not DEEPSEEK_API_KEY:
+    raise RuntimeError("未设置 DEEPSEEK_API_KEY 环境变量，请在 .env 文件中配置")
+
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 # 文档解析配置
 DOC_PARSER_CONFIG = {
     'content_keywords': [
-        '黏聚力', '内摩擦角', '压缩模量', '孔隙比', '含水量', '液限', '塑限',
-        '颗粒级配', '粒径', '筛分', '剪切', '压缩', '载荷', '承载力'
+        '凝聚力', '内摩擦角', '压缩模量', '孔隙比', '含水量', '液限', '塑限',
+        '颗粒级配', '粒径', '筛分', '剪切', '压缩', '荷载', '承载力'
     ],
     'skip_keywords': ['目录', 'Contents', '图', 'Fig', '表目录', '图目录', '参考文献'],
     'min_paragraph_length': 15,  # 最小段落长度
